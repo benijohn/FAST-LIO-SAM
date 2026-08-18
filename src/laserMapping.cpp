@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <limits>
 #include <Python.h>
+#include <chrono>
 #include <so3_math.h>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
@@ -687,6 +688,35 @@ void imu_cbk(const ImuMsgConstPtr &msg_in)
     // cout<<"IMU got at: "<<get_ros_time_sec(msg_in->header.stamp)<<endl;
     ImuMsgPtr msg(new ImuMsg(*msg_in));
 
+    // NovAtel RAWIMUSX physical IMU frame -> ROS vehicle/imu_link frame
+    // Derived from SETINSROTATION RBV 3.75 0 90
+    const Eigen::Matrix3d R_raw_to_ros = (Eigen::Matrix3d() <<
+        -0.997858923,  0.0,          0.065403129,
+        0.0,         -1.0,          0.0,
+        0.065403129,  0.0,          0.997858923
+    ).finished();
+
+    V3D gyr(
+        msg->angular_velocity.x,
+        msg->angular_velocity.y,
+        msg->angular_velocity.z);
+
+    V3D acc(
+        msg->linear_acceleration.x,
+        msg->linear_acceleration.y,
+        msg->linear_acceleration.z);
+
+    gyr = R_raw_to_ros * gyr;
+    acc = R_raw_to_ros * acc;
+
+    msg->angular_velocity.x = gyr.x();
+    msg->angular_velocity.y = gyr.y();
+    msg->angular_velocity.z = gyr.z();
+
+    msg->linear_acceleration.x = acc.x();
+    msg->linear_acceleration.y = acc.y();
+    msg->linear_acceleration.z = acc.z();
+
     if (flip_en)
     {
         // Use a proper rotation (det=+1) instead of a reflection.
@@ -830,15 +860,41 @@ bool sync_packages(MeasureGroup &meas)
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             ROS_PRINT_WARN("Too few input point cloud!");
         }
-        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
-        {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-        }
+        // else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
+        // {
+        //     lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+        // }
+        // else
+        // {
+        //     scan_num ++;
+        //     lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+        //     lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+        // }
         else
         {
-            scan_num ++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            double max_offset_ms = 0.0;
+
+            for (const auto &point : meas.lidar->points)
+            {
+                max_offset_ms = std::max(
+                    max_offset_ms,
+                    static_cast<double>(point.curvature)
+                );
+            }
+
+            const double scan_time = max_offset_ms / 1000.0;
+
+            if (scan_time < 0.5 * lidar_mean_scantime)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            }
+            else
+            {
+                scan_num++;
+                lidar_end_time = meas.lidar_beg_time + scan_time;
+                lidar_mean_scantime +=
+                    (scan_time - lidar_mean_scantime) / scan_num;
+            }
         }
         if(lidar_type == MARSIM)
             lidar_end_time = meas.lidar_beg_time;
@@ -856,18 +912,56 @@ bool sync_packages(MeasureGroup &meas)
     /*** push imu data, and pop from imu buffer ***/
     double imu_time = get_ros_time_sec(imu_buffer.front()->header.stamp);
     meas.imu.clear();
+
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
     {
         imu_time = get_ros_time_sec(imu_buffer.front()->header.stamp);
-        if(imu_time > lidar_end_time) break;
+
+        if (imu_time > lidar_end_time)
+            break;
+
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
     }
 
+    // Synchronization diagnostics
+    const double lidar_duration =
+        meas.lidar_end_time - meas.lidar_beg_time;
+
+    double imu_first = -1.0;
+    double imu_last = -1.0;
+
+    if (!meas.imu.empty())
+    {
+        imu_first =
+            get_ros_time_sec(meas.imu.front()->header.stamp);
+
+        imu_last =
+            get_ros_time_sec(meas.imu.back()->header.stamp);
+    }
+
+    ROS_PRINT_INFO(
+        "[SYNC] lidar_begin=%.6f lidar_end=%.6f duration=%.4f "
+        "imu_count=%zu imu_first=%.6f imu_last=%.6f "
+        "first_minus_begin=%+.4f last_minus_end=%+.4f "
+        "latest_imu_minus_end=%+.4f",
+        meas.lidar_beg_time,
+        meas.lidar_end_time,
+        lidar_duration,
+        meas.imu.size(),
+        imu_first,
+        imu_last,
+        (imu_first >= 0.0 ? imu_first - meas.lidar_beg_time : -999.0),
+        (imu_last >= 0.0 ? imu_last - meas.lidar_end_time : -999.0),
+        last_timestamp_imu - meas.lidar_end_time
+    );
+
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+
     setLaserCurTime(lidar_end_time);
+
     return true;
 }
 
@@ -1656,6 +1750,13 @@ int main(int argc, char** argv)
     rosparam_get("zupt/lidar_cov_static_scale",  lidar_cov_static_scale,  5.0);
     rosparam_get("zupt/lidar_residual_ref",      lidar_residual_ref,      0.05);
 
+    ROS_PRINT_WARN(
+        "[MAP PARAMS] det_range=%.3f cube_side_length=%.3f filter_size_map=%.3f",
+        static_cast<double>(DET_RANGE),
+        cube_len,
+        filter_size_map_min
+    );
+
     path.header.stamp = get_ros_now();
     path.header.frame_id = map_frame;
 
@@ -1821,10 +1922,19 @@ int main(int argc, char** argv)
                 continue;
             }
 
+            const auto perf_t0 = std::chrono::steady_clock::now();
+
+            const double perf_scan_end = Measures.lidar_end_time;
+            const double perf_latest_lidar_start = last_timestamp_lidar;
+
+            const size_t perf_lidar_q_start = lidar_buffer.size();
+            const size_t perf_imu_q_start   = imu_buffer.size();
+
             match_time = 0;
             solve_time = 0;
 
             p_imu->Process(Measures, kf, feats_undistort);
+            const auto perf_t_imu = std::chrono::steady_clock::now();
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I; // LiDAR position in the world coordinate frame
 
@@ -1914,6 +2024,7 @@ int main(int argc, char** argv)
                 geoQuat.z = state_point.rot.coeffs()[2];
                 geoQuat.w = state_point.rot.coeffs()[3];
             }
+            const auto perf_t_update = std::chrono::steady_clock::now();
 
             bool keyframe = false;
             if (sam_enable)
@@ -1926,7 +2037,9 @@ int main(int argc, char** argv)
             // GNSS callbacks are serviced on the same executor as the main loop.
             // Spin once more here so GNSS messages that arrived during the heavy
             // LiDAR/IMU processing are visible before factor selection.
+            const auto perf_t_before_spin = std::chrono::steady_clock::now();
             spin_once();
+            const auto perf_t_after_spin = std::chrono::steady_clock::now();
 
             if (sam_enable) {
                 if (keyframe)
@@ -1936,12 +2049,14 @@ int main(int argc, char** argv)
                 correctPoses();
                 publishSamMsg();
             }
+            const auto perf_t_sam = std::chrono::steady_clock::now();
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
 
             /*** add the feature points to map kdtree ***/
             map_incremental();
+            const auto perf_t_map = std::chrono::steady_clock::now();
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
@@ -1950,7 +2065,66 @@ int main(int argc, char** argv)
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect);
             if (feature_pub_en && use_online_map) publish_map(pubLaserCloudMap);
             if (feature_pub_en && use_prior_map) publish_prior_map(pubLaserCloudPriorMap);
+
+            const auto perf_t_end = std::chrono::steady_clock::now();
+
+            const double perf_total_ms =
+                std::chrono::duration<double, std::milli>(perf_t_end - perf_t0).count();
+
+            const double perf_imu_ms =
+                std::chrono::duration<double, std::milli>(perf_t_imu - perf_t0).count();
+
+            const double perf_update_ms =
+                std::chrono::duration<double, std::milli>(perf_t_update - perf_t_imu).count();
+
+            const double perf_spin_ms =
+                std::chrono::duration<double, std::milli>(
+                    perf_t_after_spin - perf_t_before_spin).count();
+
+            const double perf_sam_ms =
+                std::chrono::duration<double, std::milli>(
+                    perf_t_sam - perf_t_after_spin).count();
+
+            const double perf_map_ms =
+                std::chrono::duration<double, std::milli>(
+                    perf_t_map - perf_t_sam).count();
+
+            const double perf_publish_ms =
+                std::chrono::duration<double, std::milli>(
+                    perf_t_end - perf_t_map).count();
+
+            const double perf_backlog_start =
+                perf_latest_lidar_start - perf_scan_end;
+
+            const double perf_backlog_end =
+                last_timestamp_lidar - perf_scan_end;
+
+            ROS_PRINT_INFO(
+                "[PERF] scan=%.6f "
+                "total=%.1fms imu=%.1f update=%.1f spin=%.1f sam=%.1f map=%.1f pub=%.1f "
+                "backlog_start=%.3fs backlog_end=%.3fs "
+                "lidar_q=%zu->%zu imu_q=%zu->%zu "
+                "points=%d kdtree=%d keyframe=%d",
+                perf_scan_end,
+                perf_total_ms,
+                perf_imu_ms,
+                perf_update_ms,
+                perf_spin_ms,
+                perf_sam_ms,
+                perf_map_ms,
+                perf_publish_ms,
+                perf_backlog_start,
+                perf_backlog_end,
+                perf_lidar_q_start,
+                lidar_buffer.size(),
+                perf_imu_q_start,
+                imu_buffer.size(),
+                feats_down_size,
+                kdtree_size_st,
+                keyframe ? 1 : 0
+            );
             /*** Debug variables ***/
+
         }
 
         rate.sleep();

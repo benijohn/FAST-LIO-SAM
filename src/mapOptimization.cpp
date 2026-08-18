@@ -255,26 +255,58 @@ bool isKeyFrame()
     return true;
 }  
 
-void loopFindNearKeyframes(pcl::PointCloud<PointTypeIndex>::Ptr& nearKeyframes, const int& key, const int& searchNum)
+void loopFindNearKeyframes(
+    pcl::PointCloud<PointTypeIndex>::Ptr& nearKeyframes,
+    const int& key,
+    const int& searchNum)
 {
-    // extract near keyframes
     nearKeyframes->clear();
-    int cloudSize = copy_cloudKeyPoses6D->size();
+
+    const int cloudSize =
+        static_cast<int>(copy_cloudKeyPoses6D->size());
+
     for (int i = -searchNum; i <= searchNum; ++i)
     {
-        int keyNear = key + i;
-        if (keyNear < 0 || keyNear >= cloudSize )
+        const int keyNear = key + i;
+
+        if (keyNear < 0 || keyNear >= cloudSize)
             continue;
-        *nearKeyframes += *transformPointCloud(featCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
+
+        //
+        // IMPORTANT:
+        // When building the HISTORICAL target submap, do not allow
+        // recent/current keyframes to leak into the target.
+        //
+        // searchNum == 0 is used for the current/source cloud, so it
+        // must NOT be filtered here.
+        //
+        if (searchNum > 0)
+        {
+            const double time_diff =
+                std::abs(
+                    copy_cloudKeyPoses6D->points[keyNear].time -
+                    timeLaserInfoCur);
+
+            if (time_diff <= historyKeyframeSearchTimeDiff)
+                continue;
+        }
+
+        *nearKeyframes +=
+            *transformPointCloud(
+                featCloudKeyFrames[keyNear],
+                &copy_cloudKeyPoses6D->points[keyNear]);
     }
 
     if (nearKeyframes->empty())
         return;
 
     // downsample near keyframes
-    pcl::PointCloud<PointTypeIndex>::Ptr cloud_temp(new pcl::PointCloud<PointTypeIndex>());
+    pcl::PointCloud<PointTypeIndex>::Ptr cloud_temp(
+        new pcl::PointCloud<PointTypeIndex>());
+
     downSizeFilterICP.setInputCloud(nearKeyframes);
     downSizeFilterICP.filter(*cloud_temp);
+
     *nearKeyframes = *cloud_temp;
 }
 
@@ -293,31 +325,103 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
 
     // Find the closest history key frame in XY only.
     const auto &current_pose = copy_cloudKeyPoses3D->back();
-    const double max_dist_sq = historyKeyframeSearchRadius * historyKeyframeSearchRadius;
+    const double max_dist_sq =
+        historyKeyframeSearchRadius * historyKeyframeSearchRadius;
+
     double best_dist_sq = std::numeric_limits<double>::infinity();
-    for (int id = 0; id < static_cast<int>(copy_cloudKeyPoses3D->size()); ++id)
+
+    int spatial_candidates = 0;
+    int temporal_candidates = 0;
+    int angular_candidates = 0;
+
+    int nearest_spatial_id = -1;
+    double nearest_spatial_dist_sq = std::numeric_limits<double>::infinity();
+
+    for (int id = 0;
+         id < static_cast<int>(copy_cloudKeyPoses3D->size());
+         ++id)
     {
         if (id == loopKeyCur)
             continue;
 
         const auto &candidate_pose = copy_cloudKeyPoses3D->points[id];
+
         const double dx = candidate_pose.x - current_pose.x;
         const double dy = candidate_pose.y - current_pose.y;
         const double dist_sq = dx * dx + dy * dy;
-        if (dist_sq > max_dist_sq || dist_sq >= best_dist_sq)
+
+        // Outside spatial search radius.
+        if (dist_sq > max_dist_sq)
             continue;
 
-        if (abs(copy_cloudKeyPoses6D->points[id].time - timeLaserInfoCur) > historyKeyframeSearchTimeDiff)
-        {
-            const gtsam::Pose3 poseCur = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyCur]);
-            const gtsam::Pose3 posePre = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[id]);
-            if (rotationDistance(poseCur, posePre) > historyKeyframeSearchAngleThreshold)
-                continue;
+        spatial_candidates++;
 
+        if (dist_sq < nearest_spatial_dist_sq)
+        {
+            nearest_spatial_dist_sq = dist_sq;
+            nearest_spatial_id = id;
+        }
+
+        const double time_diff =
+            std::abs(copy_cloudKeyPoses6D->points[id].time -
+                     timeLaserInfoCur);
+
+        if (time_diff <= historyKeyframeSearchTimeDiff)
+            continue;
+
+        temporal_candidates++;
+
+        const gtsam::Pose3 poseCur =
+            pclPointTogtsamPose3(
+                copy_cloudKeyPoses6D->points[loopKeyCur]);
+
+        const gtsam::Pose3 posePre =
+            pclPointTogtsamPose3(
+                copy_cloudKeyPoses6D->points[id]);
+
+        const double rotation_diff =
+            rotationDistance(poseCur, posePre);
+
+        if (rotation_diff > historyKeyframeSearchAngleThreshold)
+            continue;
+
+        angular_candidates++;
+
+        // Keep the closest candidate that passed all gates.
+        if (dist_sq < best_dist_sq)
+        {
             loopKeyPre = id;
             best_dist_sq = dist_sq;
         }
     }
+
+    const double nearest_spatial_dist =
+        nearest_spatial_id >= 0
+            ? std::sqrt(nearest_spatial_dist_sq)
+            : -1.0;
+
+    const double selected_dist =
+        loopKeyPre >= 0
+            ? std::sqrt(best_dist_sq)
+            : -1.0;
+
+    RCLCPP_INFO(
+        rclcpp::get_logger("fastlio_mapping"),
+        "[LOOP SEARCH] cur=%d xyz=(%.2f %.2f %.2f) "
+        "spatial=%d temporal=%d angular=%d "
+        "nearest=%d nearest_dist=%.2f "
+        "selected=%d selected_dist=%.2f",
+        loopKeyCur,
+        current_pose.x,
+        current_pose.y,
+        current_pose.z,
+        spatial_candidates,
+        temporal_candidates,
+        angular_candidates,
+        nearest_spatial_id,
+        nearest_spatial_dist,
+        loopKeyPre,
+        selected_dist);
 
     if (loopKeyPre == -1 || loopKeyCur == loopKeyPre)
         return false;
@@ -373,6 +477,13 @@ void performLoopClosure()
 
     if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
         return;
+    ROS_PRINT_INFO(
+        "[LOOP] ICP accepted: current=%d previous=%d fitness=%.6f threshold=%.6f",
+        loopKeyCur,
+        loopKeyPre,
+        icp.getFitnessScore(),
+        historyKeyframeFitnessScore
+    );    
 
     // publish corrected cloud
     // if (pubIcpKeyFrames.getNumSubscribers() != 0)
@@ -451,7 +562,21 @@ void addLoopFactor()
         int indexTo = loopIndexQueue[i].second;
         gtsam::Pose3 poseBetween = loopPoseQueue[i];
         gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
-        gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+
+        gtSAMgraph.add(
+            BetweenFactor<Pose3>(
+                indexFrom,
+                indexTo,
+                poseBetween,
+                noiseBetween
+            )
+        );
+
+        ROS_PRINT_INFO(
+            "[LOOP] GTSAM factor added: %d -> %d",
+            indexFrom,
+            indexTo
+        );
     }
 
     loopIndexQueue.clear();
@@ -829,6 +954,35 @@ void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_und
 
     isamCurrentEstimate = isam->calculateEstimate();
     latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
+    // debug stuff might be able to remove later
+    const auto t = latestEstimate.translation();
+    const auto R = latestEstimate.rotation().matrix();
+
+    if (!std::isfinite(t.x()) ||
+        !std::isfinite(t.y()) ||
+        !std::isfinite(t.z()) ||
+        !R.allFinite())
+    {
+        ROS_PRINT_ERROR(
+            "[BAD POSE] key=%zu t=(%.6f %.6f %.6f)",
+            cloudKeyPoses3D->size(),
+            t.x(), t.y(), t.z()
+        );
+        return;
+    }
+
+    if (std::abs(t.x()) > 10000.0 ||
+        std::abs(t.y()) > 10000.0 ||
+        std::abs(t.z()) > 10000.0)
+    {
+        ROS_PRINT_WARN(
+            "[HUGE POSE] key=%zu t=(%.3f %.3f %.3f)",
+            cloudKeyPoses3D->size(),
+            t.x(), t.y(), t.z()
+        );
+    }
+    // END DEBUG STUFF
+
     // cout << "****************************************************" << endl;
     // isamCurrentEstimate.print("Current estimate: ");
 
@@ -855,17 +1009,67 @@ void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_und
     // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
     poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
 
-    pcl::PointCloud<PointTypeIndex>::Ptr featCloudKeyFrame(new pcl::PointCloud<PointTypeIndex>());
+    // pcl::PointCloud<PointTypeIndex>::Ptr featCloudKeyFrame(new pcl::PointCloud<PointTypeIndex>());
+    // PointTypeIndex point;
+    // for (const auto &pt : feats_undistort->points) {
+    //     Eigen::Vector3d pointBodyLidar(pt.x, pt.y, pt.z);
+    //     Eigen::Vector3d pointBodyImu(rotationLidarToIMU * pointBodyLidar + translationLidarToIMU);
+
+    //     point.x = pointBodyImu(0);
+    //     point.y = pointBodyImu(1);
+    //     point.z = pointBodyImu(2);
+    //     point.intensity = pt.intensity;
+    //     featCloudKeyFrame->push_back(point);
+    // }
+    pcl::PointCloud<PointTypeIndex>::Ptr featCloudKeyFrame(
+    new pcl::PointCloud<PointTypeIndex>());
+
     PointTypeIndex point;
-    for (const auto &pt : feats_undistort->points) {
+
+    size_t invalid_points = 0;
+    double max_abs_coord = 0.0;
+
+    for (const auto &pt : feats_undistort->points)
+    {
+        if (!std::isfinite(pt.x) ||
+            !std::isfinite(pt.y) ||
+            !std::isfinite(pt.z))
+        {
+            ++invalid_points;
+            continue;
+        }
+
         Eigen::Vector3d pointBodyLidar(pt.x, pt.y, pt.z);
-        Eigen::Vector3d pointBodyImu(rotationLidarToIMU * pointBodyLidar + translationLidarToIMU);
+        Eigen::Vector3d pointBodyImu(
+            rotationLidarToIMU * pointBodyLidar + translationLidarToIMU);
+
+        if (!pointBodyImu.allFinite())
+        {
+            ++invalid_points;
+            continue;
+        }
+
+        max_abs_coord = std::max(
+            max_abs_coord,
+            pointBodyImu.cwiseAbs().maxCoeff());
 
         point.x = pointBodyImu(0);
         point.y = pointBodyImu(1);
         point.z = pointBodyImu(2);
         point.intensity = pt.intensity;
+
         featCloudKeyFrame->push_back(point);
+    }
+
+    if (invalid_points > 0 || max_abs_coord > 10000.0)
+    {
+        ROS_PRINT_WARN(
+            "[KEYFRAME CLOUD] key=%zu invalid=%zu/%zu max_abs=%.3f",
+            cloudKeyPoses3D->size(),
+            invalid_points,
+            feats_undistort->size(),
+            max_abs_coord
+        );
     }
 
     featCloudKeyFrames.push_back(featCloudKeyFrame);
