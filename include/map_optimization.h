@@ -39,6 +39,10 @@ void MapOptimizationInit();
 
 void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_undistort);
 
+// Apply loop constraints that arrived after the most recent keyframe.  This is
+// called by the main mapping thread so GTSAM remains single-threaded.
+void processPendingLoopFactors();
+
 bool isKeyFrame();
 
 void correctPoses();
@@ -46,6 +50,7 @@ void correctPoses();
 void publishSamMsg();
 
 void loopClosureThread();
+void notifyMapOptimizationShutdown();
 
 void gnssMatchingThread();
 

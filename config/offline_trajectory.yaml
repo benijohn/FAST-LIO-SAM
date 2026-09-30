@@ -1,0 +1,24 @@
+input:
+  highrate_topic: /OdometryHighFreq
+
+timing:
+  # FAST-LIO high-rate odometry is normally well above 100 Hz. These limits
+  # report short dropouts and reject only gaps too long to interpolate safely.
+  warn_odom_gap: 0.05
+  warn_keyframe_bracket_gap: 0.05
+  max_odom_gap: 0.25
+  max_keyframe_bracket_gap: 0.25
+
+interpolation:
+  # Within each keyframe interval, preserve raw FAST-LIO relative motion and
+  # distribute only the endpoint residual using a C2 smootherstep curve.
+  smooth_translation: true
+  smooth_rotation: true
+
+quality:
+  max_anchor_error_translation: 0.00001
+  max_anchor_error_rotation_deg: 0.0001
+  warn_correction_speed: 2.0
+  warn_correction_angular_speed_deg: 20.0
+  fail_interval_adjustment_translation: 10.0
+  fail_interval_adjustment_rotation_deg: 45.0

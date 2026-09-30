@@ -20,7 +20,31 @@ float historyKeyframeSearchTimeDiff;
 float historyKeyframeSearchAngleThreshold;
 int   historyKeyframeSearchNum;
 float historyKeyframeFitnessScore;
+float loopIcpMaxCorrespondenceDistance;
 float loopWeight;
+bool  useRobustIcpGating;
+bool  robustIcpGatingDryRun;
+float robustIcpInlierDistance;
+float robustIcpMinInlierRatio;
+float robustIcpMaxInlierMse;
+float robustIcpMaxP75;
+float robustIcpMinOverlapImprovement;
+float robustIcpOverlapTolerance;
+float robustIcpP75Tolerance;
+float robustIcpMaxTranslation;
+float robustIcpMaxRotationDeg;
+int   robustIcpMinEvaluatedPoints;
+int   robustIcpCooldownKeyframes;
+bool  loopCoarseRegistrationEnable;
+int   loopCoarseSourceKeyframeSearchNum;
+float loopCoarseNdtLeafSize;
+float loopCoarseNdtResolution;
+float loopCoarseNdtStepSize;
+float loopCoarseNdtTransformationEpsilon;
+int   loopCoarseNdtMaximumIterations;
+float loopCoarseNdtFitnessScore;
+bool  loopDebugCloudsEnable;
+bool  loopDebugMetricsEnable;
 
 // global map visualization radius
 float globalMapVisualizationSearchRadius;
@@ -43,6 +67,12 @@ std::string gnss_heading_topic = "handsfree/rtk/heading";
 bool gnssEnableFlag = false;
 bool gnssPathVis = false;
 double gpsFactorMinDis = 5.0;
+double gnss_stddev_scale = 1.0;
+double gnss_min_stddev = 0.0;
+bool gnss_use_fixed_origin = false;
+double gnss_origin_latitude = 0.0;
+double gnss_origin_longitude = 0.0;
+double gnss_origin_altitude = 0.0;
 std::vector<double> gnss_extrinsic_T_raw(3, 0.0);
 std::vector<double> gnss_extrinsic_R_raw{1.0, 0.0, 0.0,
                                          0.0, 1.0, 0.0,
@@ -109,7 +139,34 @@ void read_liosam_params() {
     rosparam_get("lio_sam/historyKeyframeSearchAngleThreshold", historyKeyframeSearchAngleThreshold, 0.5f);
     rosparam_get("lio_sam/historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
     rosparam_get("lio_sam/historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3f);
+    rosparam_get(
+        "lio_sam/loopIcpMaxCorrespondenceDistance",
+        loopIcpMaxCorrespondenceDistance,
+        historyKeyframeSearchRadius * 2.0f);
     rosparam_get("lio_sam/loopWeight", loopWeight, 0.2f);
+    rosparam_get("lio_sam/useRobustIcpGating", useRobustIcpGating, false);
+    rosparam_get("lio_sam/robustIcpGatingDryRun", robustIcpGatingDryRun, true);
+    rosparam_get("lio_sam/robustIcpInlierDistance", robustIcpInlierDistance, 1.0f);
+    rosparam_get("lio_sam/robustIcpMinInlierRatio", robustIcpMinInlierRatio, 0.80f);
+    rosparam_get("lio_sam/robustIcpMaxInlierMse", robustIcpMaxInlierMse, 0.30f);
+    rosparam_get("lio_sam/robustIcpMaxP75", robustIcpMaxP75, 0.80f);
+    rosparam_get("lio_sam/robustIcpMinOverlapImprovement", robustIcpMinOverlapImprovement, 0.03f);
+    rosparam_get("lio_sam/robustIcpOverlapTolerance", robustIcpOverlapTolerance, 0.02f);
+    rosparam_get("lio_sam/robustIcpP75Tolerance", robustIcpP75Tolerance, 0.05f);
+    rosparam_get("lio_sam/robustIcpMaxTranslation", robustIcpMaxTranslation, 3.0f);
+    rosparam_get("lio_sam/robustIcpMaxRotationDeg", robustIcpMaxRotationDeg, 5.0f);
+    rosparam_get("lio_sam/robustIcpMinEvaluatedPoints", robustIcpMinEvaluatedPoints, 1000);
+    rosparam_get("lio_sam/robustIcpCooldownKeyframes", robustIcpCooldownKeyframes, 20);
+    rosparam_get("lio_sam/loopCoarseRegistrationEnable", loopCoarseRegistrationEnable, false);
+    rosparam_get("lio_sam/loopCoarseSourceKeyframeSearchNum", loopCoarseSourceKeyframeSearchNum, 3);
+    rosparam_get("lio_sam/loopCoarseNdtLeafSize", loopCoarseNdtLeafSize, 1.0f);
+    rosparam_get("lio_sam/loopCoarseNdtResolution", loopCoarseNdtResolution, 2.0f);
+    rosparam_get("lio_sam/loopCoarseNdtStepSize", loopCoarseNdtStepSize, 0.1f);
+    rosparam_get("lio_sam/loopCoarseNdtTransformationEpsilon", loopCoarseNdtTransformationEpsilon, 0.01f);
+    rosparam_get("lio_sam/loopCoarseNdtMaximumIterations", loopCoarseNdtMaximumIterations, 35);
+    rosparam_get("lio_sam/loopCoarseNdtFitnessScore", loopCoarseNdtFitnessScore, 2.0f);
+    rosparam_get("lio_sam/loopDebugCloudsEnable", loopDebugCloudsEnable, false);
+    rosparam_get("lio_sam/loopDebugMetricsEnable", loopDebugMetricsEnable, false);
 
     // Global pointcloud visualization
     rosparam_get("lio_sam/globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1e3f);
@@ -128,6 +185,14 @@ void read_gnss_params() {
     rosparam_get("gnss/gnssPathVis", gnssPathVis, false);
     rosparam_get("gnss/gnssEnableFlag", gnssEnableFlag, false);
     rosparam_get("gnss/gpsFactorMinDis", gpsFactorMinDis, 5.0);
+    rosparam_get("gnss/stddev_scale", gnss_stddev_scale, 1.0);
+    rosparam_get("gnss/min_stddev", gnss_min_stddev, 0.0);
+    rosparam_get("gnss/use_fixed_origin", gnss_use_fixed_origin, false);
+    rosparam_get("gnss/origin_latitude", gnss_origin_latitude, 0.0);
+    rosparam_get("gnss/origin_longitude", gnss_origin_longitude, 0.0);
+    rosparam_get("gnss/origin_altitude", gnss_origin_altitude, 0.0);
+    gnss_stddev_scale = std::max(gnss_stddev_scale, 1e-6);
+    gnss_min_stddev = std::max(gnss_min_stddev, 0.0);
     rosparam_get("gnss/extrinsic_T", gnss_extrinsic_T_raw,
                  std::vector<double>{0.0, 0.0, 0.0});
     rosparam_get("gnss/extrinsic_R", gnss_extrinsic_R_raw,

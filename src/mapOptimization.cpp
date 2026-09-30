@@ -1,6 +1,9 @@
 // Modified from LIO-SAM: MapOptimization.cpp
 
 #include "utility.h"
+#include <pcl/registration/ndt.h>
+
+#include <chrono>
 #include "common_utils.h"
 #include "GNSS_Processing.hpp"
 #include "gnssYaw_factor.h"
@@ -32,6 +35,7 @@
 #include <gtsam/nonlinear/ISAM2.h>
 
 #include <pcl/common/transforms.h>
+#include <pcl/common/point_tests.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
@@ -68,6 +72,10 @@ Pcl2Publisher pubLaserCloudLocal;
 
 Pcl2Publisher pubHistoryKeyFrames;
 Pcl2Publisher pubIcpKeyFrames;
+Pcl2Publisher pubLoopDebugSource;
+Pcl2Publisher pubLoopDebugTarget;
+Pcl2Publisher pubLoopDebugNdtAligned;
+Pcl2Publisher pubLoopDebugIcpAligned;
 Pcl2Publisher pubRecentKeyFrame;
 Pcl2Publisher pubCloudRegisteredRaw;
 MarkerArrayPublisher pubLoopConstraintEdge;
@@ -80,6 +88,7 @@ pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
 pcl::PointCloud<PointTypePose>::Ptr cloudKeyOdomPoses6D;
 pcl::PointCloud<PointTypeIndex>::Ptr copy_cloudKeyPoses3D;
 pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D;
+vector<pcl::PointCloud<PointTypeIndex>::Ptr> copy_featCloudKeyFrames;
 
 double timeLaserInfoCur;
 
@@ -94,12 +103,15 @@ PathMsg globalPath;
 std::mutex mtx;
 std::mutex mtxLoopInfo;
 std::mutex mtxGnssFactor;
+std::mutex workerWaitMutex;
+std::condition_variable workerWaitCondition;
 
 bool aLoopIsClosed = false;
 map<int, int> loopIndexContainer; // from new to old
 vector<pair<int, int>> loopIndexQueue;
 vector<gtsam::Pose3> loopPoseQueue;
 vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+std::atomic<bool> loopFactorsPending{false};
 
 std::deque<std::tuple<int, Eigen::Vector3d, Eigen::Matrix3d>> gnssPosFactorQueue;
 std::deque<std::pair<int, double>> gnssYawFactorQueue;
@@ -109,6 +121,25 @@ std::unordered_set<int> pos_keys;
 std::unordered_set<int> yaw_keys;
 
 void correctPoses();
+
+bool waitForWorkerPeriod(const double frequencyHz)
+{
+    const double safeFrequency = std::max(frequencyHz, 1e-3);
+    const auto period = std::chrono::duration<double>(1.0 / safeFrequency);
+    std::unique_lock<std::mutex> lock(workerWaitMutex);
+    return workerWaitCondition.wait_for(
+        lock,
+        period,
+        []()
+        {
+            return flg_exit.load() || !ros_ok();
+        });
+}
+
+void notifyMapOptimizationShutdown()
+{
+    workerWaitCondition.notify_all();
+}
 
 pcl::VoxelGrid<PointTypeIndex> downSizeFilterICP;
 
@@ -158,6 +189,183 @@ float rotationDistance(const gtsam::Pose3& poseFrom, const gtsam::Pose3& poseTo)
     double cosTheta = (deltaR.trace() - 1.0) * 0.5;
     cosTheta = std::max(-1.0, std::min(1.0, cosTheta));
     return static_cast<float>(std::acos(cosTheta));
+}
+
+struct LoopAlignmentMetrics
+{
+    bool valid = false;
+    std::size_t evaluated = 0;
+    double rms = std::numeric_limits<double>::quiet_NaN();
+    double p50 = std::numeric_limits<double>::quiet_NaN();
+    double p75 = std::numeric_limits<double>::quiet_NaN();
+    double p90 = std::numeric_limits<double>::quiet_NaN();
+    double gateInlierRatio = 0.0;
+    double gateInlierMse = std::numeric_limits<double>::quiet_NaN();
+    double correctionTranslation = std::numeric_limits<double>::quiet_NaN();
+    double matrixTranslation = std::numeric_limits<double>::quiet_NaN();
+    double correctionRotationDeg = std::numeric_limits<double>::quiet_NaN();
+};
+
+LoopAlignmentMetrics calculateLoopAlignmentMetrics(
+    const char* stage,
+    const pcl::PointCloud<PointTypeIndex>::Ptr& alignedSource,
+    const pcl::PointCloud<PointTypeIndex>::Ptr& target,
+    const Eigen::Matrix4f& correction,
+    const PointTypePose& referencePose)
+{
+    LoopAlignmentMetrics metrics;
+    if (alignedSource->empty() || target->empty())
+        return metrics;
+
+    pcl::KdTreeFLANN<PointTypeIndex> targetTree;
+    targetTree.setInputCloud(target);
+
+    std::vector<float> distances;
+    distances.reserve(alignedSource->size());
+    std::vector<int> nearestIndex(1);
+    std::vector<float> nearestSquaredDistance(1);
+    double squaredDistanceSum = 0.0;
+    std::size_t withinHalfMeter = 0;
+    std::size_t withinOneMeter = 0;
+    std::size_t withinTwoMeters = 0;
+    double withinHalfMeterSquaredDistanceSum = 0.0;
+    double withinOneMeterSquaredDistanceSum = 0.0;
+    double withinTwoMetersSquaredDistanceSum = 0.0;
+    std::size_t gateInlierCount = 0;
+    double gateInlierSquaredDistanceSum = 0.0;
+    const double gateInlierDistance = std::max(
+        0.0, static_cast<double>(robustIcpInlierDistance));
+
+    for (const auto& point : alignedSource->points)
+    {
+        if (!pcl::isFinite(point) ||
+            targetTree.nearestKSearch(
+                point, 1, nearestIndex, nearestSquaredDistance) <= 0)
+        {
+            continue;
+        }
+
+        const float distance = std::sqrt(nearestSquaredDistance[0]);
+        distances.push_back(distance);
+        squaredDistanceSum += nearestSquaredDistance[0];
+        if (distance <= 0.5f)
+        {
+            ++withinHalfMeter;
+            withinHalfMeterSquaredDistanceSum += nearestSquaredDistance[0];
+        }
+        if (distance <= 1.0f)
+        {
+            ++withinOneMeter;
+            withinOneMeterSquaredDistanceSum += nearestSquaredDistance[0];
+        }
+        if (distance <= 2.0f)
+        {
+            ++withinTwoMeters;
+            withinTwoMetersSquaredDistanceSum += nearestSquaredDistance[0];
+        }
+        if (distance <= gateInlierDistance)
+        {
+            ++gateInlierCount;
+            gateInlierSquaredDistanceSum += nearestSquaredDistance[0];
+        }
+    }
+
+    if (distances.empty())
+    {
+        ROS_PRINT_WARN("[LOOP METRICS] stage=%s has no finite nearest-neighbor pairs", stage);
+        return metrics;
+    }
+
+    std::sort(distances.begin(), distances.end());
+    const auto percentile = [&distances](const double fraction)
+    {
+        const std::size_t index = static_cast<std::size_t>(
+            std::round(fraction * static_cast<double>(distances.size() - 1)));
+        return distances[index];
+    };
+    const double count = static_cast<double>(distances.size());
+    const auto inlierRms = [](const double squaredDistanceSum, const std::size_t inlierCount)
+    {
+        return inlierCount > 0
+            ? std::sqrt(squaredDistanceSum / static_cast<double>(inlierCount))
+            : std::numeric_limits<double>::quiet_NaN();
+    };
+
+    Eigen::Affine3f correctionAffine(correction);
+    float x, y, z, roll, pitch, yaw;
+    pcl::getTranslationAndEulerAngles(
+        correctionAffine, x, y, z, roll, pitch, yaw);
+    constexpr double radiansToDegrees = 180.0 / M_PI;
+
+    metrics.valid = correction.allFinite();
+    metrics.evaluated = distances.size();
+    metrics.rms = std::sqrt(squaredDistanceSum / count);
+    metrics.p50 = percentile(0.50);
+    metrics.p75 = percentile(0.75);
+    metrics.p90 = percentile(0.90);
+    metrics.gateInlierRatio = static_cast<double>(gateInlierCount) / count;
+    metrics.gateInlierMse = gateInlierCount > 0
+        ? gateInlierSquaredDistanceSum / static_cast<double>(gateInlierCount)
+        : std::numeric_limits<double>::quiet_NaN();
+    metrics.matrixTranslation = std::sqrt(x * x + y * y + z * z);
+
+    // The translation column of a rigid transform is not invariant to a
+    // change in map origin.  For example, a small rotation of a scan located
+    // hundreds of metres from the origin requires a large compensating
+    // matrix translation even when the sensor pose moves only a metre.  Gate
+    // the actual displacement of the current keyframe origin instead.
+    const Eigen::Vector4d referencePosition(
+        referencePose.x, referencePose.y, referencePose.z, 1.0);
+    const Eigen::Vector4d correctedReferencePosition =
+        correction.cast<double>() * referencePosition;
+    const Eigen::Vector3d poseCorrection =
+        correctedReferencePosition.head<3>() - referencePosition.head<3>();
+    metrics.correctionTranslation = poseCorrection.norm();
+    double correctionCosAngle =
+        (correction.block<3, 3>(0, 0).cast<double>().trace() - 1.0) * 0.5;
+    correctionCosAngle = std::max(-1.0, std::min(1.0, correctionCosAngle));
+    metrics.correctionRotationDeg =
+        std::acos(correctionCosAngle) * radiansToDegrees;
+
+    if (loopDebugMetricsEnable)
+    {
+        ROS_PRINT_INFO(
+            "[LOOP METRICS] stage=%s evaluated=%zu source=%zu target=%zu "
+            "nn_rms=%.3fm p50=%.3fm p75=%.3fm p90=%.3fm "
+            "within_0.5m=%.1f%% within_1.0m=%.1f%% within_2.0m=%.1f%% "
+            "inlier_rms_0.5m=%.3fm inlier_rms_1.0m=%.3fm inlier_rms_2.0m=%.3fm "
+            "gate_dist=%.2fm gate_inliers=%.1f%% gate_inlier_mse=%.3fm^2 "
+            "correction_xyz=(%.3f, %.3f, %.3f)m correction_norm=%.3fm "
+            "matrix_translation_xyz=(%.3f, %.3f, %.3f)m matrix_translation_norm=%.3fm "
+            "correction_rpy=(%.2f, %.2f, %.2f)deg correction_angle=%.2fdeg",
+            stage,
+            distances.size(),
+            alignedSource->size(),
+            target->size(),
+            metrics.rms,
+            metrics.p50,
+            metrics.p75,
+            metrics.p90,
+            100.0 * static_cast<double>(withinHalfMeter) / count,
+            100.0 * static_cast<double>(withinOneMeter) / count,
+            100.0 * static_cast<double>(withinTwoMeters) / count,
+            inlierRms(withinHalfMeterSquaredDistanceSum, withinHalfMeter),
+            inlierRms(withinOneMeterSquaredDistanceSum, withinOneMeter),
+            inlierRms(withinTwoMetersSquaredDistanceSum, withinTwoMeters),
+            gateInlierDistance,
+            100.0 * metrics.gateInlierRatio,
+            metrics.gateInlierMse,
+            poseCorrection.x(), poseCorrection.y(), poseCorrection.z(),
+            metrics.correctionTranslation,
+            x, y, z,
+            metrics.matrixTranslation,
+            roll * radiansToDegrees,
+            pitch * radiansToDegrees,
+            yaw * radiansToDegrees,
+            metrics.correctionRotationDeg);
+    }
+
+    return metrics;
 }
 
 PointTypePose trans2PointTypePose(float transformIn[])
@@ -228,6 +436,10 @@ void MapOptimizationInit()
     pubRecentKeyFrame = create_publisher<PointCloud2Msg>("lio_sam/mapping/cloud_recent_keyframe", 1);
     pubLoopConstraintEdge = create_publisher<MarkerArrayMsg>("lio_sam/loop_closure_constraints", 1);
     pubKeyFrameYawMarkers = create_publisher<MarkerArrayMsg>("lio_sam/mapping/keyframe_yaw", 1);
+    pubLoopDebugSource = create_transient_local_publisher<PointCloud2Msg>("lio_sam/loop/source");
+    pubLoopDebugTarget = create_transient_local_publisher<PointCloud2Msg>("lio_sam/loop/target");
+    pubLoopDebugNdtAligned = create_transient_local_publisher<PointCloud2Msg>("lio_sam/loop/ndt_aligned");
+    pubLoopDebugIcpAligned = create_transient_local_publisher<PointCloud2Msg>("lio_sam/loop/icp_aligned");
 
     downSizeFilterICP.setLeafSize(mappingICPSize, mappingICPSize, mappingICPSize);
 
@@ -258,12 +470,17 @@ bool isKeyFrame()
 void loopFindNearKeyframes(
     pcl::PointCloud<PointTypeIndex>::Ptr& nearKeyframes,
     const int& key,
-    const int& searchNum)
+    const int& searchNum,
+    const int& temporalReferenceKey,
+    const bool excludeTemporalOverlap)
 {
     nearKeyframes->clear();
 
-    const int cloudSize =
-        static_cast<int>(copy_cloudKeyPoses6D->size());
+    const int cloudSize = static_cast<int>(std::min(
+        copy_cloudKeyPoses6D->size(), copy_featCloudKeyFrames.size()));
+
+    if (temporalReferenceKey < 0 || temporalReferenceKey >= cloudSize)
+        return;
 
     for (int i = -searchNum; i <= searchNum; ++i)
     {
@@ -280,12 +497,17 @@ void loopFindNearKeyframes(
         // searchNum == 0 is used for the current/source cloud, so it
         // must NOT be filtered here.
         //
-        if (searchNum > 0)
+        if (searchNum > 0 && excludeTemporalOverlap)
         {
+            // Exclude target frames near the current loop keyframe in sensor
+            // time, while retaining frames surrounding the historical target
+            // key itself.  The reference must be the current loop key, not
+            // the target key, otherwise every target-neighborhood frame is
+            // filtered out.
             const double time_diff =
                 std::abs(
                     copy_cloudKeyPoses6D->points[keyNear].time -
-                    timeLaserInfoCur);
+                    copy_cloudKeyPoses6D->points[temporalReferenceKey].time);
 
             if (time_diff <= historyKeyframeSearchTimeDiff)
                 continue;
@@ -293,7 +515,7 @@ void loopFindNearKeyframes(
 
         *nearKeyframes +=
             *transformPointCloud(
-                featCloudKeyFrames[keyNear],
+                copy_featCloudKeyFrames[keyNear],
                 &copy_cloudKeyPoses6D->points[keyNear]);
     }
 
@@ -320,7 +542,10 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
     if (it != loopIndexContainer.end())
         return false;
 
-    if (ikdtreeHistoryKeyPoses->Root_Node == nullptr)
+    // Candidate selection scans the immutable pose snapshot below. Waiting
+    // for ten complete keyframes preserves the old tree-build startup gate
+    // without reading the tree while the mapping thread may mutate it.
+    if (copy_cloudKeyPoses3D->size() < 10)
         return false;
 
     // Find the closest history key frame in XY only.
@@ -362,9 +587,13 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
             nearest_spatial_id = id;
         }
 
+        // A loop must be separated from the current *keyframe* by the
+        // configured history duration.  timeLaserInfoCur advances on every
+        // incoming scan and is not a valid substitute when no keyframe is
+        // added (for example, while the vehicle is stopped).
         const double time_diff =
             std::abs(copy_cloudKeyPoses6D->points[id].time -
-                     timeLaserInfoCur);
+                     copy_cloudKeyPoses6D->points[loopKeyCur].time);
 
         if (time_diff <= historyKeyframeSearchTimeDiff)
             continue;
@@ -434,13 +663,30 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
 
 void performLoopClosure()
 {
-    if (cloudKeyPoses3D->points.empty())
-        return;
+    size_t odomPoseCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (cloudKeyPoses3D->points.empty())
+            return;
 
-    mtx.lock();
-    *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
-    *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
-    mtx.unlock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        copy_featCloudKeyFrames = featCloudKeyFrames;
+        odomPoseCount = cloudKeyOdomPoses6D->size();
+    }
+
+    const size_t pose3Count = copy_cloudKeyPoses3D->size();
+    const size_t pose6Count = copy_cloudKeyPoses6D->size();
+    const size_t cloudCount = copy_featCloudKeyFrames.size();
+    if (pose3Count != pose6Count || pose3Count != cloudCount ||
+        pose3Count != odomPoseCount)
+    {
+        ROS_PRINT_ERROR(
+            "[LOOP] Keyframe snapshot invariant failed: pose3=%zu pose6=%zu "
+            "odom=%zu clouds=%zu; skipping closure safely",
+            pose3Count, pose6Count, odomPoseCount, cloudCount);
+        return;
+    }
 
     // find keys
     int loopKeyCur;
@@ -449,21 +695,168 @@ void performLoopClosure()
 
     // extract cloud
     pcl::PointCloud<PointTypeIndex>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointTypeIndex>());
+    pcl::PointCloud<PointTypeIndex>::Ptr coarseSourceKeyframeCloud(
+        new pcl::PointCloud<PointTypeIndex>());
     pcl::PointCloud<PointTypeIndex>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointTypeIndex>());
+    const int sourceSearchNum = loopCoarseRegistrationEnable
+        ? std::max(0, loopCoarseSourceKeyframeSearchNum)
+        : 0;
     {
         // cloud near latest keyframe 
-        loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0);
+        // Always keep the original one-keyframe source for a strict fallback.
+        loopFindNearKeyframes(
+            cureKeyframeCloud,
+            loopKeyCur,
+            0,
+            loopKeyCur,
+            false);
+        // The NDT path uses a configurable local source window.  It is only
+        // promoted to the fine-ICP source after NDT passes its own gate.
+        if (loopCoarseRegistrationEnable)
+        {
+            loopFindNearKeyframes(
+                coarseSourceKeyframeCloud,
+                loopKeyCur,
+                sourceSearchNum,
+                loopKeyCur,
+                false);
+        }
         // cloud near previous loop keyframe
-        loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+        loopFindNearKeyframes(
+            prevKeyframeCloud,
+            loopKeyPre,
+            historyKeyframeSearchNum,
+            loopKeyCur,
+            true);
+
+        if (loopDebugCloudsEnable)
+        {
+            const auto &debug_source = loopCoarseRegistrationEnable
+                ? coarseSourceKeyframeCloud
+                : cureKeyframeCloud;
+            publishCloudAlways(
+                pubLoopDebugSource, debug_source, timeLaserInfoStamp, map_frame);
+            publishCloudAlways(
+                pubLoopDebugTarget, prevKeyframeCloud, timeLaserInfoStamp, map_frame);
+        }
         if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
+        {
+            ROS_PRINT_WARN(
+                "[LOOP] ICP skipped: current=%d previous=%d source_points=%zu "
+                "target_points=%zu required_source=300 required_target=1000",
+                loopKeyCur,
+                loopKeyPre,
+                cureKeyframeCloud->size(),
+                prevKeyframeCloud->size());
             return;
+        }
         // if (pubHistoryKeyFrames.getNumSubscribers() != 0)
         //     publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
     }
 
-    // ICP Settings
+    const auto &current_pose = copy_cloudKeyPoses6D->points[loopKeyCur];
+    const auto &previous_pose = copy_cloudKeyPoses6D->points[loopKeyPre];
+    ROS_PRINT_INFO(
+        "[LOOP] ICP attempt: current=%d previous=%d key_delta=%d "
+        "pose_delta=(%.2f, %.2f, %.2f)m source_points=%zu target_points=%zu "
+        "max_corr=%.2fm",
+        loopKeyCur,
+        loopKeyPre,
+        loopKeyCur - loopKeyPre,
+        current_pose.x - previous_pose.x,
+        current_pose.y - previous_pose.y,
+        current_pose.z - previous_pose.z,
+        cureKeyframeCloud->size(),
+        prevKeyframeCloud->size(),
+        loopIcpMaxCorrespondenceDistance);
+
+    Eigen::Matrix4f coarse_initial_guess = Eigen::Matrix4f::Identity();
+    if (loopCoarseRegistrationEnable)
+    {
+        const auto ndt_start = std::chrono::steady_clock::now();
+        pcl::VoxelGrid<PointTypeIndex> coarse_filter;
+        coarse_filter.setLeafSize(
+            loopCoarseNdtLeafSize,
+            loopCoarseNdtLeafSize,
+            loopCoarseNdtLeafSize);
+
+        pcl::PointCloud<PointTypeIndex>::Ptr coarse_source(
+            new pcl::PointCloud<PointTypeIndex>());
+        pcl::PointCloud<PointTypeIndex>::Ptr coarse_target(
+            new pcl::PointCloud<PointTypeIndex>());
+        coarse_filter.setInputCloud(coarseSourceKeyframeCloud);
+        coarse_filter.filter(*coarse_source);
+        coarse_filter.setInputCloud(prevKeyframeCloud);
+        coarse_filter.filter(*coarse_target);
+
+        pcl::NormalDistributionsTransform<PointTypeIndex, PointTypeIndex> ndt;
+        ndt.setResolution(loopCoarseNdtResolution);
+        ndt.setStepSize(loopCoarseNdtStepSize);
+        ndt.setTransformationEpsilon(loopCoarseNdtTransformationEpsilon);
+        ndt.setMaximumIterations(loopCoarseNdtMaximumIterations);
+        ndt.setInputSource(coarse_source);
+        ndt.setInputTarget(coarse_target);
+        pcl::PointCloud<PointTypeIndex> ndt_result;
+        ndt.align(ndt_result);
+
+        if (loopDebugCloudsEnable || loopDebugMetricsEnable)
+        {
+            pcl::PointCloud<PointTypeIndex>::Ptr ndt_result_ptr(
+                new pcl::PointCloud<PointTypeIndex>(ndt_result));
+            if (loopDebugCloudsEnable)
+            {
+                publishCloudAlways(
+                    pubLoopDebugNdtAligned,
+                    ndt_result_ptr,
+                    timeLaserInfoStamp,
+                    map_frame);
+            }
+            calculateLoopAlignmentMetrics(
+                "NDT",
+                ndt_result_ptr,
+                prevKeyframeCloud,
+                ndt.getFinalTransformation(),
+                current_pose);
+        }
+
+        const bool ndt_converged = ndt.hasConverged();
+        const double ndt_fitness = ndt.getFitnessScore();
+        const bool ndt_usable = ndt_converged && std::isfinite(ndt_fitness) &&
+            ndt_fitness <= loopCoarseNdtFitnessScore;
+        const double ndt_duration_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ndt_start).count();
+        if (ndt_usable)
+        {
+            coarse_initial_guess = ndt.getFinalTransformation();
+            cureKeyframeCloud = coarseSourceKeyframeCloud;
+        }
+
+        ROS_PRINT_INFO(
+            "[LOOP] NDT coarse: current=%d previous=%d source_points=%zu "
+            "target_points=%zu converged=%s fitness=%.6f threshold=%.6f "
+            "used=%s source_window=%d duration=%.1fms",
+            loopKeyCur,
+            loopKeyPre,
+            coarse_source->size(),
+            coarse_target->size(),
+            ndt_converged ? "true" : "false",
+            ndt_fitness,
+            loopCoarseNdtFitnessScore,
+            ndt_usable ? "true" : "false",
+            sourceSearchNum,
+            ndt_duration_ms);
+        if (!ndt_usable)
+        {
+            ROS_PRINT_WARN(
+                "[LOOP] NDT coarse rejected; falling back to identity ICP guess");
+        }
+    }
+
+    // ICP Settings. NDT may provide only an initial guess. Loop constraints
+    // can pass either the legacy global fitness gate or the optional robust
+    // overlap/inlier gate below.
     static pcl::IterativeClosestPoint<PointTypeIndex, PointTypeIndex> icp;
-    icp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius*2);
+    icp.setMaxCorrespondenceDistance(loopIcpMaxCorrespondenceDistance);
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
@@ -472,17 +865,160 @@ void performLoopClosure()
     // Align clouds
     icp.setInputSource(cureKeyframeCloud);
     icp.setInputTarget(prevKeyframeCloud);
+    LoopAlignmentMetrics initialMetrics;
+    if (loopDebugMetricsEnable || useRobustIcpGating)
+    {
+        pcl::PointCloud<PointTypeIndex>::Ptr icpInitialAligned(
+            new pcl::PointCloud<PointTypeIndex>());
+        pcl::transformPointCloud(
+            *cureKeyframeCloud,
+            *icpInitialAligned,
+            coarse_initial_guess);
+        initialMetrics = calculateLoopAlignmentMetrics(
+            "ICP_INITIAL",
+            icpInitialAligned,
+            prevKeyframeCloud,
+            coarse_initial_guess,
+            current_pose);
+    }
     pcl::PointCloud<PointTypeIndex>::Ptr unused_result(new pcl::PointCloud<PointTypeIndex>());
-    icp.align(*unused_result);
+    icp.align(*unused_result, coarse_initial_guess);
 
-    if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
+    if (loopDebugCloudsEnable)
+    {
+        publishCloudAlways(
+            pubLoopDebugIcpAligned,
+            unused_result,
+            timeLaserInfoStamp,
+            map_frame);
+    }
+    LoopAlignmentMetrics finalMetrics;
+    if (loopDebugMetricsEnable || useRobustIcpGating)
+    {
+        finalMetrics = calculateLoopAlignmentMetrics(
+            "ICP",
+            unused_result,
+            prevKeyframeCloud,
+            icp.getFinalTransformation(),
+            current_pose);
+    }
+
+    const bool icp_converged = icp.hasConverged();
+    const double icp_fitness = icp.getFitnessScore();
+    const bool legacyPass = icp_converged && std::isfinite(icp_fitness) &&
+        icp_fitness <= historyKeyframeFitnessScore;
+
+    static int lastRobustAcceptedKey = -1;
+    const bool robustBaseValid = icp_converged && std::isfinite(icp_fitness) &&
+        finalMetrics.valid;
+    const bool robustPointCount = finalMetrics.evaluated >=
+        static_cast<std::size_t>(std::max(0, robustIcpMinEvaluatedPoints));
+    const bool robustTranslation = std::isfinite(finalMetrics.correctionTranslation) &&
+        finalMetrics.correctionTranslation <= robustIcpMaxTranslation;
+    const bool robustRotation = std::isfinite(finalMetrics.correctionRotationDeg) &&
+        finalMetrics.correctionRotationDeg <= robustIcpMaxRotationDeg;
+    const bool robustOverlap = std::isfinite(finalMetrics.gateInlierRatio) &&
+        finalMetrics.gateInlierRatio >= robustIcpMinInlierRatio;
+    const bool robustInlierMse = std::isfinite(finalMetrics.gateInlierMse) &&
+        finalMetrics.gateInlierMse <= robustIcpMaxInlierMse;
+    const bool robustP75 = std::isfinite(finalMetrics.p75) &&
+        finalMetrics.p75 <= robustIcpMaxP75;
+
+    const bool initialGood = initialMetrics.valid &&
+        initialMetrics.evaluated >=
+            static_cast<std::size_t>(std::max(0, robustIcpMinEvaluatedPoints)) &&
+        initialMetrics.gateInlierRatio >= robustIcpMinInlierRatio &&
+        std::isfinite(initialMetrics.gateInlierMse) &&
+        initialMetrics.gateInlierMse <= robustIcpMaxInlierMse &&
+        std::isfinite(initialMetrics.p75) &&
+        initialMetrics.p75 <= robustIcpMaxP75;
+    const bool robustImprovement = initialMetrics.valid &&
+        finalMetrics.gateInlierRatio >=
+            initialMetrics.gateInlierRatio + robustIcpMinOverlapImprovement &&
+        finalMetrics.p75 < initialMetrics.p75;
+    const bool robustNonDegrading = initialMetrics.valid &&
+        finalMetrics.gateInlierRatio >=
+            initialMetrics.gateInlierRatio - robustIcpOverlapTolerance &&
+        finalMetrics.p75 <= initialMetrics.p75 + robustIcpP75Tolerance;
+    const bool robustCooldown = lastRobustAcceptedKey < 0 ||
+        loopKeyCur - lastRobustAcceptedKey >= robustIcpCooldownKeyframes;
+
+    const bool robustCandidate = useRobustIcpGating && robustBaseValid &&
+        robustPointCount && robustTranslation && robustRotation &&
+        robustOverlap && robustInlierMse && robustP75 &&
+        (initialGood || robustImprovement) && robustNonDegrading && robustCooldown;
+    const bool robustApplied = robustCandidate && !robustIcpGatingDryRun;
+
+    if (useRobustIcpGating)
+    {
+        ROS_PRINT_INFO(
+            "[LOOP ROBUST] current=%d previous=%d candidate=%s applied=%s dry_run=%s "
+            "base=%s points=%s translation=%s rotation=%s overlap=%s inlier_mse=%s "
+            "p75=%s initial_good=%s improved=%s non_degrading=%s cooldown=%s "
+            "evaluated=%zu inliers=%.1f%%/%.1f%% inlier_mse=%.3f/%.3fm^2 "
+            "p75=%.3f/%.3fm correction=%.3f/%.3fm rotation=%.2f/%.2fdeg "
+            "overlap_gain=%.1f%%/%.1f%%",
+            loopKeyCur,
+            loopKeyPre,
+            robustCandidate ? "true" : "false",
+            robustApplied ? "true" : "false",
+            robustIcpGatingDryRun ? "true" : "false",
+            robustBaseValid ? "pass" : "FAIL",
+            robustPointCount ? "pass" : "FAIL",
+            robustTranslation ? "pass" : "FAIL",
+            robustRotation ? "pass" : "FAIL",
+            robustOverlap ? "pass" : "FAIL",
+            robustInlierMse ? "pass" : "FAIL",
+            robustP75 ? "pass" : "FAIL",
+            initialGood ? "pass" : "no",
+            robustImprovement ? "pass" : "no",
+            robustNonDegrading ? "pass" : "FAIL",
+            robustCooldown ? "pass" : "FAIL",
+            finalMetrics.evaluated,
+            100.0 * finalMetrics.gateInlierRatio,
+            100.0 * static_cast<double>(robustIcpMinInlierRatio),
+            finalMetrics.gateInlierMse,
+            robustIcpMaxInlierMse,
+            finalMetrics.p75,
+            robustIcpMaxP75,
+            finalMetrics.correctionTranslation,
+            robustIcpMaxTranslation,
+            finalMetrics.correctionRotationDeg,
+            robustIcpMaxRotationDeg,
+            100.0 * (finalMetrics.gateInlierRatio - initialMetrics.gateInlierRatio),
+            100.0 * static_cast<double>(robustIcpMinOverlapImprovement));
+    }
+
+    if (!legacyPass && !robustApplied)
+    {
+        const char* rejectionReason = !icp_converged ? "not_converged" :
+            (!std::isfinite(icp_fitness) ? "non_finite_fitness" :
+            (robustCandidate && robustIcpGatingDryRun ? "robust_gate_dry_run" :
+            (useRobustIcpGating ? "legacy_and_robust_gates_failed" :
+            "fitness_above_threshold")));
+        ROS_PRINT_WARN(
+            "[LOOP] ICP rejected: current=%d previous=%d converged=%s "
+            "fitness=%.6f threshold=%.6f reason=%s",
+            loopKeyCur,
+            loopKeyPre,
+            icp_converged ? "true" : "false",
+            icp_fitness,
+            historyKeyframeFitnessScore,
+            rejectionReason);
         return;
+    }
+    if (robustApplied)
+        lastRobustAcceptedKey = loopKeyCur;
+    const char* acceptanceMode = legacyPass
+        ? (robustApplied ? "legacy+robust" : "legacy")
+        : "robust";
     ROS_PRINT_INFO(
-        "[LOOP] ICP accepted: current=%d previous=%d fitness=%.6f threshold=%.6f",
+        "[LOOP] ICP accepted: current=%d previous=%d fitness=%.6f threshold=%.6f mode=%s",
         loopKeyCur,
         loopKeyPre,
-        icp.getFitnessScore(),
-        historyKeyframeFitnessScore
+        icp_fitness,
+        historyKeyframeFitnessScore,
+        acceptanceMode
     );    
 
     // publish corrected cloud
@@ -515,6 +1051,7 @@ void performLoopClosure()
     loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
     loopPoseQueue.push_back(poseFrom.between(poseTo));
     loopNoiseQueue.push_back(constraintNoise);
+    loopFactorsPending.store(true, std::memory_order_release);
     mtx.unlock();
 
     // add loop constriant
@@ -551,17 +1088,35 @@ void addOdomFactor()
     }
 }
 
-void addLoopFactor()
+int addLoopFactor()
 {
-    if (loopIndexQueue.empty())
-        return;
+    if (!loopFactorsPending.load(std::memory_order_acquire))
+        return 0;
 
-    for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
+    vector<pair<int, int>> indexQueue;
+    vector<gtsam::Pose3> poseQueue;
+    vector<gtsam::noiseModel::Diagonal::shared_ptr> noiseQueue;
     {
-        int indexFrom = loopIndexQueue[i].first;
-        int indexTo = loopIndexQueue[i].second;
-        gtsam::Pose3 poseBetween = loopPoseQueue[i];
-        gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
+        // The loop-closure thread only writes these queues.  Move a complete
+        // batch to the mapping thread before touching the GTSAM graph.
+        std::lock_guard<std::mutex> lock(mtx);
+        if (loopIndexQueue.empty())
+        {
+            loopFactorsPending.store(false, std::memory_order_release);
+            return 0;
+        }
+        indexQueue.swap(loopIndexQueue);
+        poseQueue.swap(loopPoseQueue);
+        noiseQueue.swap(loopNoiseQueue);
+        loopFactorsPending.store(false, std::memory_order_release);
+    }
+
+    for (int i = 0; i < (int)indexQueue.size(); ++i)
+    {
+        int indexFrom = indexQueue[i].first;
+        int indexTo = indexQueue[i].second;
+        gtsam::Pose3 poseBetween = poseQueue[i];
+        gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = noiseQueue[i];
 
         gtSAMgraph.add(
             BetweenFactor<Pose3>(
@@ -579,10 +1134,44 @@ void addLoopFactor()
         );
     }
 
-    loopIndexQueue.clear();
-    loopPoseQueue.clear();
-    loopNoiseQueue.clear();
     aLoopIsClosed = true;
+    return static_cast<int>(indexQueue.size());
+}
+
+void processPendingLoopFactors()
+{
+    // Keep the idle path to one atomic read.  In particular, do not run an
+    // empty iSAM update for every LiDAR scan.
+    if (!loopFactorsPending.load(std::memory_order_acquire))
+        return;
+
+    const auto updateStart = std::chrono::steady_clock::now();
+    const int factorsAdded = addLoopFactor();
+    if (factorsAdded == 0)
+        return;
+
+    // No new variables are introduced: loop factors connect keyframes that
+    // already exist in iSAM.  Mirror the extra relinearization passes used by
+    // saveKeyFramesAndFactor() when it consumes a loop constraint.
+    isam->update(gtSAMgraph, initialEstimate);
+    isam->update();
+    isam->update();
+    isam->update();
+    isam->update();
+    isam->update();
+    isam->update();
+
+    gtSAMgraph.resize(0);
+    initialEstimate.clear();
+    isamCurrentEstimate = isam->calculateEstimate();
+
+    const double durationMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - updateStart).count();
+    ROS_PRINT_INFO(
+        "[LOOP] optimized %d queued factor(s) without waiting for a new "
+        "keyframe duration=%.1fms",
+        factorsAdded,
+        durationMs);
 }
 
 bool findNearestKeyframeByTime(const std::vector<PointTypePose> &keyposes,
@@ -774,6 +1363,14 @@ void processGnssPos(const std::vector<PointTypePose> &keyposes)
             gnss_cov(2, 2) = 0.01;
         }
 
+        const double covariance_scale = gnss_stddev_scale * gnss_stddev_scale;
+        gnss_cov *= covariance_scale;
+        const double min_variance = gnss_min_stddev * gnss_min_stddev;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            gnss_cov(axis, axis) = std::max(gnss_cov(axis, axis), min_variance);
+        }
+
         if (!gnss_pos.allFinite())
         {
             PosData dropped;
@@ -814,6 +1411,17 @@ void processGnssPos(const std::vector<PointTypePose> &keyposes)
                 gnss_pos,
                 gnss_cov);
         }
+
+        ROS_PRINT_INFO(
+            "[GNSS] queued GPS factor: key=%d enu=(%.2f, %.2f, %.2f) "
+            "sigma=(%.2f, %.2f, %.2f)m stddev_scale=%.2f min_stddev=%.2f",
+            key,
+            gnss_pos.x(), gnss_pos.y(), gnss_pos.z(),
+            std::sqrt(gnss_cov(0, 0)),
+            std::sqrt(gnss_cov(1, 1)),
+            std::sqrt(gnss_cov(2, 2)),
+            gnss_stddev_scale,
+            gnss_min_stddev);
     }
 }
 
@@ -917,7 +1525,8 @@ void updatePath(const PointTypePose& pose_in)
 
 void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_undistort)
 {
-    const PointTypePose OdomPose = trans2PointTypePose(transformTobeMapped);
+    PointTypePose OdomPose = trans2PointTypePose(transformTobeMapped);
+    OdomPose.time = timeLaserInfoCur;
 
     // odom factor
     addOdomFactor();
@@ -989,21 +1598,13 @@ void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_und
     thisPose3D.x = latestEstimate.translation().x();
     thisPose3D.y = latestEstimate.translation().y();
     thisPose3D.z = latestEstimate.translation().z();
-    thisPose3D.intensity = cloudKeyPoses3D->size(); // this can be used as index
-    cloudKeyPoses3D->push_back(thisPose3D);
-
     thisPose6D.x = thisPose3D.x;
     thisPose6D.y = thisPose3D.y;
     thisPose6D.z = thisPose3D.z;
-    thisPose6D.intensity = thisPose3D.intensity ; // this can be used as index
     thisPose6D.roll  = latestEstimate.rotation().roll();
     thisPose6D.pitch = latestEstimate.rotation().pitch();
     thisPose6D.yaw   = latestEstimate.rotation().yaw();
     thisPose6D.time = timeLaserInfoCur;
-    cloudKeyPoses6D->push_back(thisPose6D);
-
-    updatePath(thisPose6D);
-
     // cout << "****************************************************" << endl;
     // cout << "Pose covariance:" << endl;
     // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
@@ -1072,8 +1673,37 @@ void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_und
         );
     }
 
-    featCloudKeyFrames.push_back(featCloudKeyFrame);
-    cloudKeyOdomPoses6D->push_back(OdomPose);
+    // Publish a keyframe only after every part of it is complete. The loop
+    // thread snapshots these four containers under the same mutex, so it
+    // cannot observe a pose whose cloud is still being constructed.
+    size_t keyIndex = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        const size_t pose3Count = cloudKeyPoses3D->size();
+        const size_t pose6Count = cloudKeyPoses6D->size();
+        const size_t odomCount = cloudKeyOdomPoses6D->size();
+        const size_t cloudCount = featCloudKeyFrames.size();
+        if (pose3Count != pose6Count || pose3Count != odomCount ||
+            pose3Count != cloudCount)
+        {
+            ROS_PRINT_ERROR(
+                "[KEYFRAME] Container invariant failed before append: "
+                "pose3=%zu pose6=%zu odom=%zu clouds=%zu; keyframe dropped",
+                pose3Count, pose6Count, odomCount, cloudCount);
+            return;
+        }
+
+        keyIndex = pose3Count;
+        thisPose3D.intensity = static_cast<float>(keyIndex);
+        thisPose6D.intensity = static_cast<float>(keyIndex);
+        OdomPose.intensity = static_cast<float>(keyIndex);
+        cloudKeyPoses3D->push_back(thisPose3D);
+        cloudKeyPoses6D->push_back(thisPose6D);
+        cloudKeyOdomPoses6D->push_back(OdomPose);
+        featCloudKeyFrames.push_back(featCloudKeyFrame);
+    }
+
+    updatePath(thisPose6D);
 
     if (keyframe_export_en)
     {
@@ -1083,18 +1713,21 @@ void saveKeyFramesAndFactor(pcl::PointCloud<pcl::PointXYZINormal>::Ptr feats_und
         pcd_writer.writeBinary(pcd_path, *feats_undistort);
     }
 
-    if (ikdtreeHistoryKeyPoses->Root_Node == nullptr) {
-        initPoses3D.push_back(thisPose3D);
-        if (cloudKeyPoses3D->points.size() < 10)
-            return;
-        ikdtreeHistoryKeyPoses->Build(initPoses3D);
-    } else {
-        ikdtreeHistoryKeyPoses->Add_Point(thisPose3D);
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (ikdtreeHistoryKeyPoses->Root_Node == nullptr) {
+            initPoses3D.push_back(thisPose3D);
+            if (cloudKeyPoses3D->points.size() >= 10)
+                ikdtreeHistoryKeyPoses->Build(initPoses3D);
+        } else {
+            ikdtreeHistoryKeyPoses->Add_Point(thisPose3D);
+        }
     }
 }
 
 void ReconstructIkdTree()
 {
+    std::lock_guard<std::mutex> lock(mtx);
     if (ikdtreeHistoryKeyPoses->Root_Node == nullptr)
         return;
     if (cloudKeyPoses3D->points.empty())
@@ -1114,52 +1747,62 @@ void ReconstructIkdTree()
 
 void correctPoses()
 {
-    if (cloudKeyPoses3D->points.empty())
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (cloudKeyPoses3D->points.empty())
+            return;
+    }
 
     if (aLoopIsClosed == true)
     {
-        // clear path
-        globalPath.poses.clear();
-        // update key poses
-        int numPoses = isamCurrentEstimate.size();
-        for (int i = 0; i < numPoses; ++i)
         {
-            cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-            cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-            cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+            std::lock_guard<std::mutex> lock(mtx);
+            globalPath.poses.clear();
 
-            cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
-            cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
-            cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-            cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-            cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-            cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+            const size_t numPoses = std::min(
+                static_cast<size_t>(isamCurrentEstimate.size()),
+                std::min(cloudKeyPoses3D->size(), cloudKeyPoses6D->size()));
+            for (size_t i = 0; i < numPoses; ++i)
+            {
+                cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
+                cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
+                cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
 
-            updatePath(cloudKeyPoses6D->points[i]);
+                cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
+                cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
+                cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
+                cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
+                cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
+                cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+
+                updatePath(cloudKeyPoses6D->points[i]);
+            }
         }
 
         ReconstructIkdTree();
         aLoopIsClosed = false;
     }
 
-    if (!cloudKeyOdomPoses6D->points.empty() &&
-        cloudKeyOdomPoses6D->points.size() == cloudKeyPoses6D->points.size())
     {
-        const size_t ref = cloudKeyPoses6D->points.size() - 1;
-        const gtsam::Pose3 pose_map_ref = pclPointTogtsamPose3(cloudKeyPoses6D->points[ref]);
-        const gtsam::Pose3 pose_odom_ref = pclPointTogtsamPose3(cloudKeyOdomPoses6D->points[ref]);
-        const Eigen::Matrix3d R_map_odom =
-            pose_map_ref.rotation().matrix() * pose_odom_ref.rotation().matrix().transpose();
-        const Eigen::Vector3d t_map_odom =
-            Eigen::Vector3d(pose_map_ref.translation().x(),
-                             pose_map_ref.translation().y(),
-                             pose_map_ref.translation().z()) -
-            R_map_odom * Eigen::Vector3d(pose_odom_ref.translation().x(),
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!cloudKeyOdomPoses6D->points.empty() &&
+            cloudKeyOdomPoses6D->points.size() == cloudKeyPoses6D->points.size())
+        {
+            const size_t ref = cloudKeyPoses6D->points.size() - 1;
+            const gtsam::Pose3 pose_map_ref = pclPointTogtsamPose3(cloudKeyPoses6D->points[ref]);
+            const gtsam::Pose3 pose_odom_ref = pclPointTogtsamPose3(cloudKeyOdomPoses6D->points[ref]);
+            const Eigen::Matrix3d R_map_odom =
+                pose_map_ref.rotation().matrix() * pose_odom_ref.rotation().matrix().transpose();
+            const Eigen::Vector3d t_map_odom =
+                Eigen::Vector3d(pose_map_ref.translation().x(),
+                                 pose_map_ref.translation().y(),
+                                 pose_map_ref.translation().z()) -
+                R_map_odom * Eigen::Vector3d(pose_odom_ref.translation().x(),
                                              pose_odom_ref.translation().y(),
                                              pose_odom_ref.translation().z());
-        setMapOdom(R_map_odom, t_map_odom);
-        publishMapToOdomTf(get_ros_time(timeLaserInfoCur));
+            setMapOdom(R_map_odom, t_map_odom);
+            publishMapToOdomTf(get_ros_time(timeLaserInfoCur));
+        }
     }
 }
 
@@ -1283,11 +1926,13 @@ void loopClosureThread()
 
     ROS_PRINT_INFO("...... Loop Closure Thread Start......");
 
-    RateType rate(loopClosureFrequency);
     while (ros_ok() && !flg_exit)
     {
-        rate.sleep();
+        if (waitForWorkerPeriod(loopClosureFrequency))
+            break;
         performLoopClosure();
+        if (flg_exit || !ros_ok())
+            break;
         visualizeLoopClosure();
     }
 }
@@ -1297,11 +1942,10 @@ void gnssMatchingThread()
     if (!gnssEnableFlag)
         return;
 
-    RateType rate(50);
-
     while (ros_ok() && !flg_exit)
     {
-        rate.sleep();
+        if (waitForWorkerPeriod(50.0))
+            break;
         if (!gnss_aligned.load())
             continue;
         performGnssMatching();
@@ -1335,9 +1979,6 @@ void publishGlobalMap() {
     if (ros_subscription_count(pubLaserCloudGlobal) == 0)
         return;
 
-    if (cloudKeyPoses3D->points.empty())
-        return;
-
     pcl::PointCloud<PointTypeIndex>::Ptr globalMapKeyPoses(new pcl::PointCloud<PointTypeIndex>());
     pcl::PointCloud<PointTypeIndex>::Ptr globalMapKeyPosesDS(new pcl::PointCloud<PointTypeIndex>());
     pcl::PointCloud<PointTypeIndex>::Ptr globalMapKeyFrames(new pcl::PointCloud<PointTypeIndex>());
@@ -1345,14 +1986,38 @@ void publishGlobalMap() {
 
     // ikd-tree to find near key frames to visualize
     KD_TREE_PUBLIC<PointTypeIndex>::PointVector globalMapSearchPoses3D;
-    std::vector<float> pointSearchSqDisGlobalMap;
-    // search near key frames to visualize
-    mtx.lock();
-    ikdtreeHistoryKeyPoses->Radius_Search(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, globalMapSearchPoses3D);
-    mtx.unlock();
+    pcl::PointCloud<PointTypeIndex>::Ptr pose3Snapshot(new pcl::PointCloud<PointTypeIndex>());
+    pcl::PointCloud<PointTypePose>::Ptr pose6Snapshot(new pcl::PointCloud<PointTypePose>());
+    vector<pcl::PointCloud<PointTypeIndex>::Ptr> cloudSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (cloudKeyPoses3D->points.empty() ||
+            ikdtreeHistoryKeyPoses->Root_Node == nullptr)
+            return;
+        if (cloudKeyPoses3D->size() != cloudKeyPoses6D->size() ||
+            cloudKeyPoses3D->size() != featCloudKeyFrames.size())
+        {
+            ROS_PRINT_ERROR(
+                "[GLOBAL MAP] Keyframe invariant failed: pose3=%zu pose6=%zu clouds=%zu",
+                cloudKeyPoses3D->size(), cloudKeyPoses6D->size(),
+                featCloudKeyFrames.size());
+            return;
+        }
+
+        *pose3Snapshot = *cloudKeyPoses3D;
+        *pose6Snapshot = *cloudKeyPoses6D;
+        cloudSnapshot = featCloudKeyFrames;
+        ikdtreeHistoryKeyPoses->Radius_Search(
+            pose3Snapshot->back(), globalMapVisualizationSearchRadius,
+            globalMapSearchPoses3D);
+    }
 
     for (int i = 0; i < (int)globalMapSearchPoses3D.size(); ++i)
-        globalMapKeyPoses->push_back(cloudKeyPoses3D->points[globalMapSearchPoses3D[i].intensity]); // index stored in intensity field
+    {
+        const int key = static_cast<int>(globalMapSearchPoses3D[i].intensity);
+        if (key >= 0 && key < static_cast<int>(pose3Snapshot->size()))
+            globalMapKeyPoses->push_back(pose3Snapshot->points[key]);
+    }
     // downsample near selected key frames
     pcl::VoxelGrid<PointTypeIndex> downSizeFilterGlobalMapKeyPoses; // for global map visualization
     downSizeFilterGlobalMapKeyPoses.setLeafSize(globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity); // for global map visualization
@@ -1360,16 +2025,32 @@ void publishGlobalMap() {
     downSizeFilterGlobalMapKeyPoses.filter(*globalMapKeyPosesDS);
     for(auto& pt : globalMapKeyPosesDS->points)
     {
-        ikdtreeHistoryKeyPoses->Nearest_Search(pt, 1, globalMapSearchPoses3D, pointSearchSqDisGlobalMap);
-        pt.intensity = cloudKeyPoses3D->points[globalMapSearchPoses3D[0].intensity].intensity;
+        float nearestDistanceSq = std::numeric_limits<float>::infinity();
+        int nearestKey = -1;
+        for (const auto &candidate : pose3Snapshot->points)
+        {
+            const float dx = pt.x - candidate.x;
+            const float dy = pt.y - candidate.y;
+            const float dz = pt.z - candidate.z;
+            const float distanceSq = dx * dx + dy * dy + dz * dz;
+            if (distanceSq < nearestDistanceSq)
+            {
+                nearestDistanceSq = distanceSq;
+                nearestKey = static_cast<int>(candidate.intensity);
+            }
+        }
+        pt.intensity = static_cast<float>(nearestKey);
     }
 
     // extract visualized and downsampled key frames
     for (int i = 0; i < (int)globalMapKeyPosesDS->size(); ++i){
-        if (pointDistance(globalMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
+        if (pointDistance(globalMapKeyPosesDS->points[i], pose3Snapshot->back()) > globalMapVisualizationSearchRadius)
             continue;
         int thisKeyInd = (int)globalMapKeyPosesDS->points[i].intensity;
-        *globalMapKeyFrames += *transformPointCloud(featCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
+        if (thisKeyInd < 0 || thisKeyInd >= static_cast<int>(cloudSnapshot.size()))
+            continue;
+        *globalMapKeyFrames += *transformPointCloud(
+            cloudSnapshot[thisKeyInd], &pose6Snapshot->points[thisKeyInd]);
     }
     // downsample visualized points
     pcl::VoxelGrid<PointTypeIndex> downSizeFilterGlobalMapKeyFrames; // for global map visualization
@@ -1381,9 +2062,9 @@ void publishGlobalMap() {
 
 void visualizeGlobalMapThread()
 {
-    RateType rate(0.2);
     while (ros_ok() && !flg_exit){
-        rate.sleep();
+        if (waitForWorkerPeriod(0.2))
+            break;
         publishGlobalMap();
     }
 }

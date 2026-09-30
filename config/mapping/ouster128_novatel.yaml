@@ -19,12 +19,27 @@ gnss:
     topic: "/novatel/oem7/fix"
     heading_topic: "/novatel/oem7/odom"
 
-    gnssPathVis: false
-    gnssEnableFlag: false
+    # Start with deliberately gentle GNSS factors.  Lower min_stddev after
+    # verifying the reported NovAtel covariance and ENU alignment.
+    gnssPathVis: true
+    gnssEnableFlag: true
 
     gpsFactorMinDis: 5.0
+    stddev_scale: 1.0
+    min_stddev: 2.0
 
-    extrinsic_T: [0.0, 0.0, 0.0]
+    # Common ENU datum for multi-session maps. Altitude deliberately uses the
+    # value reported on /novatel/oem7/fix (the topic consumed below), rather
+    # than the 31.6 m higher ellipsoidal value in NovAtel GPSFix.
+    use_fixed_origin: true
+    origin_latitude: 34.399072206970
+    origin_longitude: -82.138620318436
+    origin_altitude: 146.572827416472
+
+    # GNSS antenna position relative to the top LiDAR center, in the top
+    # LiDAR frame.  Derived from the NovAtel-IMU-to-antenna measurement and
+    # mapping/extrinsic_T,R (LiDAR -> NovAtel IMU).
+    extrinsic_T: [1.55520, -0.13300, -0.34585]
     extrinsic_R: [1.0, 0.0, 0.0,
                   0.0, 1.0, 0.0,
                   0.0, 0.0, 1.0]
@@ -32,7 +47,7 @@ gnss:
     heading_offset_deg: 0.0
     useYawFactor: false
     yawFactorSigma: 0.1
-    useGnssElevation: false
+    useGnssElevation: true
 
 preprocess:
     lidar_type: 3
@@ -84,19 +99,48 @@ lio_sam:
     loopClosureFrequency: 0.5                     # Hz, regulate loop closure constraint add frequency
     surroundingKeyframeSize: 50                   # submap size (when loop closure enabled)
     historyKeyframeSearchRadius: 25.0             # meters, key frame that is within n meters from current pose will be considerd for loop closure
-    historyKeyframeSearchTimeDiff: 5.0           # seconds, key frame that is n seconds older will be considered for loop closure
+    historyKeyframeSearchTimeDiff: 25.0           # seconds, key frame that is n seconds older will be considered for loop closure
     historyKeyframeSearchAngleThreshold: 3.15      # radians, loop candidate orientation gap threshold
-    historyKeyframeSearchNum: 25                  # number of hostory key frames will be fused into a submap for loop closure
+    historyKeyframeSearchNum: 25                  # target submap uses up to this many historical keyframes on each side
     historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
-    loopWeight: 0.02                               # loop factor variance scale, smaller is stronger
+    loopIcpMaxCorrespondenceDistance: 50.0         # meters, reject farther source-target pairs during ICP
+    loopWeight: 0.05                               # loop factor variance scale, smaller is stronger
+    # Optional robust ICP gate. Legacy fitness acceptance remains active; this
+    # can additionally accept a geometrically strong match whose global MSE is
+    # inflated by vegetation, occlusion, or limited submap overlap.
+    useRobustIcpGating: true
+    robustIcpGatingDryRun: false                   # true logs decisions but does not add robust-only factors
+    robustIcpInlierDistance: 1.0                   # meters, nearest-neighbor distance defining an inlier
+    robustIcpMinInlierRatio: 0.80                  # minimum fraction of evaluated source points within the inlier distance
+    robustIcpMaxInlierMse: 0.30                    # m^2, maximum mean squared error among inliers
+    robustIcpMaxP75: 0.80                          # meters, maximum 75th-percentile nearest-neighbor distance
+    robustIcpMinOverlapImprovement: 0.03           # required inlier-ratio gain when the initial alignment is not already good
+    robustIcpOverlapTolerance: 0.02                # maximum allowed inlier-ratio degradation from the initial alignment
+    robustIcpP75Tolerance: 0.05                    # meters, maximum allowed p75 degradation from the initial alignment
+    robustIcpMaxTranslation: 3.0                   # meters, maximum ICP correction magnitude
+    robustIcpMaxRotationDeg: 5.0                   # degrees, maximum ICP correction angle
+    robustIcpMinEvaluatedPoints: 1000              # minimum finite source-to-target nearest-neighbor pairs
+    robustIcpCooldownKeyframes: 20                 # minimum current-key index separation between robust acceptances
     mappingICPSize: 0.5                            # meters, loop-closure ICP voxel size
+    # Optional coarse NDT -> existing fine ICP loop registration. Disabled by
+    # default: setting this false preserves the pre-NDT one-keyframe ICP path.
+    loopCoarseRegistrationEnable: true
+    loopCoarseSourceKeyframeSearchNum: 3           # current keyframe plus up to this many preceding source keyframes
+    loopCoarseNdtLeafSize: 1.0                     # meters, extra downsampling used only by NDT
+    loopCoarseNdtResolution: 3.0                   # meters, NDT voxel resolution
+    loopCoarseNdtStepSize: 0.1                     # meters, NDT optimization step size
+    loopCoarseNdtTransformationEpsilon: 0.01
+    loopCoarseNdtMaximumIterations: 35
+    loopCoarseNdtFitnessScore: 2.0                 # reject NDT initial guesses above this; ICP still uses 0.3
+    loopDebugCloudsEnable: true                    # retained source/target/NDT/ICP clouds for Foxglove diagnosis
+    loopDebugMetricsEnable: true                   # log residual percentiles, overlap fractions, and corrections
 
     # Visualization
     globalMapVisualizationSearchRadius: 1000.0    # meters, global map visualization radius
     globalMapVisualizationPoseDensity: 10.0       # meters, global map visualization keyframe density
     globalMapVisualizationLeafSize: 0.05           # meters, global map visualization cloud density
 
-    keyframe_export_en: false                      # export each keyframe as a full-resolution PCD
+    keyframe_export_en: true                       # export each keyframe as a full-resolution PCD
     keyframe_global_pcd_en: false                  # stitch exported keyframes into one global PCD
 
 publish:
@@ -109,7 +153,7 @@ publish:
 result_save:
     feat_accum_save_en: false     # save accumulated world-frame undistorted feature scans as PCD
     interval: -1                 # how many LiDAR frames to accumulate before writing one PCD; -1 saves only once at shutdown
-    imu_state_save_en: true       # save each IMU state to ROOT_DIR/IMU_STATES/imu_states.txt
+    imu_state_save_en: false      # keyframe poses/clouds are the offline optimization artifacts
     scan_frame_save_en: false    # save each undistorted scan in LiDAR body frame and pose to ROOT_DIR/SCAN_FRAMES/
                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
     ikdtree_output_save_en: false  # true: save the ikdtree point cloud to ROOT_DIR/TREE_CLOUDS/

@@ -468,6 +468,7 @@ void save_ikdtree_cloud(const string& ikdtree_cloud_path)
 void SigHandle(int sig)
 {
     flg_exit = true;
+    notifyMapOptimizationShutdown();
     ROS_PRINT_WARN("catch sig %d", sig);
     sig_buffer.notify_all();
 }
@@ -1382,6 +1383,8 @@ void publish_odometryhighfreq(PoseBuffer& pbuffer,
             usleep(1000);
             continue;
         }
+        if (flg_exit || !ros_ok())
+            break;
         OdomMsg msg_local;
         const auto stamp = get_ros_time(pose._timestamp);
 
@@ -1681,7 +1684,15 @@ int main(int argc, char** argv)
     init_ros_node();
     
     #elif defined(USE_ROS2)
-    rclcpp::init(argc, argv);
+    // FAST-LIO owns shutdown sequencing through SigHandle.  The default
+    // rclcpp signal handler would invalidate the middleware context as soon
+    // as SIGINT arrives, before worker threads and publishers are joined and
+    // destroyed, which can hang publisher cleanup until launch sends SIGTERM.
+    rclcpp::init(
+        argc,
+        argv,
+        rclcpp::InitOptions(),
+        rclcpp::SignalHandlerOptions::None);
     init_ros_node(rclcpp::Node::make_shared("fast_lio_sam"));
     #endif
 
@@ -1767,6 +1778,36 @@ int main(int argc, char** argv)
     if (p_gnss)
     {
         p_gnss->setOffset(heading_offset);
+        if (gnss_use_fixed_origin)
+        {
+            const bool valid_origin =
+                std::isfinite(gnss_origin_latitude) &&
+                std::isfinite(gnss_origin_longitude) &&
+                std::isfinite(gnss_origin_altitude) &&
+                gnss_origin_latitude >= -90.0 &&
+                gnss_origin_latitude <= 90.0 &&
+                gnss_origin_longitude >= -180.0 &&
+                gnss_origin_longitude <= 180.0;
+            if (valid_origin)
+            {
+                p_gnss->InitOriginPosition(
+                    gnss_origin_latitude,
+                    gnss_origin_longitude,
+                    gnss_origin_altitude);
+                ROS_PRINT_INFO(
+                    "[GNSS] fixed ENU origin lat=%.12f lon=%.12f alt=%.6fm",
+                    gnss_origin_latitude,
+                    gnss_origin_longitude,
+                    gnss_origin_altitude);
+            }
+            else
+            {
+                ROS_PRINT_ERROR(
+                    "[GNSS] invalid fixed origin; falling back to the first "
+                    "usable fix");
+                gnss_use_fixed_origin = false;
+            }
+        }
     }
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -2046,6 +2087,11 @@ int main(int argc, char** argv)
                 {
                     saveKeyFramesAndFactor(feats_undistort);
                 }
+                // A loop can be detected after the vehicle has stopped and
+                // therefore after the final keyframe.  Flush it from this
+                // main thread on the next scan instead of leaving it queued
+                // indefinitely waiting for another keyframe.
+                processPendingLoopFactors();
                 correctPoses();
                 publishSamMsg();
             }
@@ -2130,7 +2176,29 @@ int main(int argc, char** argv)
         rate.sleep();
     }            
 
-    if (!flg_exit && pcl_wait_save->size() > 0 && feat_accum_save_en)
+    const bool exitWasRequested = flg_exit.load();
+
+    // Stop every publisher-owning worker before exporting or allowing ROS
+    // entities to begin destruction.  In particular, the global-map thread
+    // normally sleeps for five seconds; its interruptible wait is notified
+    // here so launch does not escalate SIGINT to SIGTERM while join() waits.
+    flg_exit = true;
+    notifyMapOptimizationShutdown();
+    sig_buffer.notify_all();
+    if (odomhighthread.joinable()) {
+        odomhighthread.join();
+    }
+    if (loopthread.joinable()) {
+        loopthread.join();
+    }
+    if (globalthread.joinable()) {
+        globalthread.join();
+    }
+    if (gnssthread.joinable()) {
+        gnssthread.join();
+    }
+
+    if (!exitWasRequested && pcl_wait_save->size() > 0 && feat_accum_save_en)
     {
         const std::string stamp_str = format_unix_time(lidar_end_time);
         const std::string file_name = stamp_str + string(".pcd");
@@ -2164,20 +2232,6 @@ int main(int argc, char** argv)
         }
 
         pcd_writer.writeBinary(global_keyframe_path, *keyframe_global_cloud);
-    }
-
-    flg_exit = true;
-    if (odomhighthread.joinable()) {
-        odomhighthread.join();
-    }
-    if (loopthread.joinable()) {
-        loopthread.join();
-    }
-    if (globalthread.joinable()) {
-        globalthread.join();
-    }
-    if (gnssthread.joinable()) {
-        gnssthread.join();
     }
 
     if (ikdtree_output_save_en && use_online_map && ikdtree.Root_Node != nullptr)

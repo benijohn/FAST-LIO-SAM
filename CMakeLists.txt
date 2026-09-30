@@ -123,6 +123,8 @@ if(USE_ROS2)
   find_package(tf2_eigen REQUIRED)
   find_package(livox_ros_driver2)
   find_package(visualization_msgs REQUIRED)
+  find_package(rosbag2_cpp REQUIRED)
+  find_package(yaml-cpp REQUIRED)
 
   rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/Pose6D.msg"
@@ -154,10 +156,42 @@ if(USE_ROS2)
   add_executable(pcd_to_ikdtree_bin include/ikd-Tree/pcd_to_ikdtree_bin.cpp include/ikd-Tree/ikd_Tree.cpp)
   target_link_libraries(pcd_to_ikdtree_bin ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
   target_include_directories(pcd_to_ikdtree_bin PRIVATE ${PYTHON_INCLUDE_DIRS})
+
+  add_library(offline_global_core STATIC
+    src/offline_global/io.cpp
+    src/offline_global/elevation.cpp
+    src/offline_global/submaps.cpp
+    src/offline_global/registration.cpp
+    src/offline_global/optimizer.cpp
+    src/offline_global/trajectory_refinement.cpp)
+  ament_target_dependencies(offline_global_core
+    rclcpp
+    sensor_msgs
+    nav_msgs
+    rosbag2_cpp
+    PCL)
+  target_link_libraries(offline_global_core
+    ${PCL_LIBRARIES}
+    gtsam
+    yaml-cpp)
+
+  add_executable(offline_global_optimizer src/offline_global/main.cpp)
+  target_link_libraries(offline_global_optimizer offline_global_core)
+
+  add_executable(offline_trajectory_refiner
+    src/offline_global/trajectory_refiner_main.cpp)
+  target_link_libraries(offline_trajectory_refiner offline_global_core)
+
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_offline_global test/test_offline_global.cpp)
+    target_link_libraries(test_offline_global offline_global_core gtsam)
+  endif()
   install(
   DIRECTORY
     launch_ROS2
     config
+    docs
     DESTINATION share/${PROJECT_NAME}
   )
   install(
@@ -169,6 +203,10 @@ if(USE_ROS2)
   install(TARGETS fastlio_mapping
     DESTINATION lib/${PROJECT_NAME})
   install(TARGETS pcd_to_ikdtree_bin
+    DESTINATION lib/${PROJECT_NAME})
+  install(TARGETS offline_global_optimizer
+    DESTINATION lib/${PROJECT_NAME})
+  install(TARGETS offline_trajectory_refiner
     DESTINATION lib/${PROJECT_NAME})
   install(DIRECTORY include/ DESTINATION include)
 

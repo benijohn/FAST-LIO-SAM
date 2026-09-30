@@ -31,7 +31,34 @@ extern float historyKeyframeSearchTimeDiff;
 extern float historyKeyframeSearchAngleThreshold;
 extern int   historyKeyframeSearchNum;
 extern float historyKeyframeFitnessScore;
+extern float loopIcpMaxCorrespondenceDistance;
 extern float loopWeight;
+// Optional robust ICP acceptance gate. This supplements (and does not replace)
+// the legacy global fitness-score gate.
+extern bool  useRobustIcpGating;
+extern bool  robustIcpGatingDryRun;
+extern float robustIcpInlierDistance;
+extern float robustIcpMinInlierRatio;
+extern float robustIcpMaxInlierMse;
+extern float robustIcpMaxP75;
+extern float robustIcpMinOverlapImprovement;
+extern float robustIcpOverlapTolerance;
+extern float robustIcpP75Tolerance;
+extern float robustIcpMaxTranslation;
+extern float robustIcpMaxRotationDeg;
+extern int   robustIcpMinEvaluatedPoints;
+extern int   robustIcpCooldownKeyframes;
+// Optional coarse registration before the existing loop-closure ICP.
+extern bool  loopCoarseRegistrationEnable;
+extern int   loopCoarseSourceKeyframeSearchNum;
+extern float loopCoarseNdtLeafSize;
+extern float loopCoarseNdtResolution;
+extern float loopCoarseNdtStepSize;
+extern float loopCoarseNdtTransformationEpsilon;
+extern int   loopCoarseNdtMaximumIterations;
+extern float loopCoarseNdtFitnessScore;
+extern bool  loopDebugCloudsEnable;
+extern bool  loopDebugMetricsEnable;
 
 // global map visualization radius
 extern float globalMapVisualizationSearchRadius;
@@ -58,6 +85,12 @@ extern std::string gnss_heading_topic;
 extern bool gnssEnableFlag;
 extern bool gnssPathVis;
 extern double gpsFactorMinDis;
+extern double gnss_stddev_scale;
+extern double gnss_min_stddev;
+extern bool gnss_use_fixed_origin;
+extern double gnss_origin_latitude;
+extern double gnss_origin_longitude;
+extern double gnss_origin_altitude;
 extern std::vector<double> gnss_extrinsic_T_raw;
 extern std::vector<double> gnss_extrinsic_R_raw;
 extern Eigen::Vector3d gnss_extrinsic_T;
@@ -122,6 +155,18 @@ void publishCloud(Pcl2Publisher &thisPub, const T &thisCloud, TimeType thisStamp
     tempCloud.header.frame_id = thisFrame;
     if (ros_subscription_count(thisPub) != 0)
         ros_publish(thisPub, tempCloud);
+}
+
+// Diagnostic/transient-local publishers must publish even when there are no
+// current subscribers so that a later Foxglove connection receives the sample.
+template<typename T>
+void publishCloudAlways(Pcl2Publisher &thisPub, const T &thisCloud, TimeType thisStamp, const std::string &thisFrame)
+{
+    PointCloud2Msg tempCloud;
+    pcl::toROSMsg(*thisCloud, tempCloud);
+    tempCloud.header.stamp = thisStamp;
+    tempCloud.header.frame_id = thisFrame;
+    ros_publish(thisPub, tempCloud);
 }
 
 #endif

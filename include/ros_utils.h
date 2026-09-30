@@ -305,6 +305,12 @@ inline ros::Publisher create_publisher(const std::string& topic, uint32_t queue_
     return get_ros_nh()->advertise<T>(topic, queue_size);
 }
 
+// Retain the most recent diagnostic message for late subscribers.
+template<typename T>
+inline ros::Publisher create_transient_local_publisher(const std::string& topic) {
+    return get_ros_nh()->advertise<T>(topic, 1, true);
+}
+
 // Publisher creation for ROS1 with QoS (ignores QoS parameter, ROS1 has no QoS support)
 template<typename T, typename QosType>
 inline ros::Publisher create_publisher_qos(const std::string& topic, const QosType& qos) {
@@ -361,6 +367,15 @@ inline typename rclcpp::Subscription<T>::SharedPtr create_subscriber(const std::
 template<typename T>
 inline typename rclcpp::Publisher<T>::SharedPtr create_publisher(const std::string& topic, uint32_t queue_size) {
     return get_ros_node()->create_publisher<T>(topic, rclcpp::QoS(rclcpp::KeepLast(queue_size)));
+}
+
+// Retain the most recent diagnostic message for late subscribers.
+template<typename T>
+inline typename rclcpp::Publisher<T>::SharedPtr create_transient_local_publisher(const std::string& topic) {
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1));
+    qos.reliable();
+    qos.transient_local();
+    return get_ros_node()->create_publisher<T>(topic, qos);
 }
 
 // Publisher creation for ROS2 with custom QoS

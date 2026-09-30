@@ -1,0 +1,111 @@
+datum:
+  latitude: 34.399072206970
+  longitude: -82.138620318436
+  altitude: 146.572827416472
+
+sessions:
+  # These recordings are known not to contain a currently valid trajectory for
+  # global fitting. Entries may be DATE/TIME or DATE/TIME/BAG.
+  exclude:
+    - 20260803/134427
+    - 20260803/134806
+    - 20260803/135144
+    - 20260804/132837
+    - 20260804/133123
+    - 20260804/133202
+    - 20260804/133418
+
+submaps:
+  anchor_spacing: 10.0
+  trajectory_window: 12.0
+  min_range: 1.2
+  max_range: 60.0
+  coarse_voxel: 1.0
+  fine_voxel: 0.30
+  preview_voxel: 0.50
+
+registration:
+  candidate_xy: 15.0
+  candidate_z: 10.0
+  constraint_spacing: 15.0
+  max_neighbors: 4
+  use_ndt: true
+  ndt_resolution: 2.0
+  ndt_iterations: 40
+  fine_iterations: 80
+  fine_max_correspondence: 5.0
+
+# Use repeated trail locations to remove constant session elevation offsets
+# before asking vegetation-heavy LiDAR registration to refine the alignment.
+elevation_alignment:
+  enable: true
+  xy_radius: 2.0
+  parallel_angle_deg: 30.0
+  crossing_angle_deg: 60.0
+  min_overlap_length: 15.0
+  min_overlap_samples: 10
+  factor_spacing: 10.0
+  overlap_sigma: 0.35
+  crossing_sigma: 0.65
+  crossing_cluster_radius: 5.0
+  offset_prior_sigma: 3.0
+  max_initial_offset: 5.0
+
+gates:
+  min_evaluated_points: 3000
+  min_within_1m: 0.75
+  max_p75: 0.75
+  max_correction_translation: 5.0
+  max_correction_rotation_deg: 10.0
+  max_reverse_translation: 0.30
+  max_reverse_rotation_deg: 1.0
+
+gnss:
+  topic: /novatel/oem7/fix
+  spacing: 5.0
+  time_tolerance: 0.10
+  xy_sigma_floor: 0.25
+  z_sigma_floor: 0.50
+  sigma_ceiling: 10.0
+  huber_k: 1.345
+
+optimization:
+  cauchy_scale: 2.0
+  z_bias_prior_sigma: 3.0
+  odom_rotation_sigma: 0.01
+  odom_translation_sigma: 0.03
+  anchor_rotation_prior_sigma: 0.02
+  anchor_translation_prior_sigma: 0.10
+  # Conservative floors are intentional for dense vegetation. Point count
+  # alone must not make a bush registration centimeter-accurate.
+  lidar_rotation_sigma_floor: 0.03
+  lidar_rotation_sigma_ceiling: 0.20
+  lidar_translation_sigma_floor: 0.20
+  lidar_translation_sigma_ceiling: 1.0
+  chi2_6d_99: 16.8119
+  warn_z_bias: 5.0
+  warn_xy_correction: 5.0
+
+rigid_optimization:
+  # One Pose2 per session adjusts only X/Y/yaw. FAST-LIO roll and pitch are
+  # copied unchanged, so a long run cannot fake elevation by tilting.
+  yaw_sigma_deg: 3.0
+  xy_prior_sigma: 2.0
+
+vertical_optimization:
+  # The overlap-derived constant session offset is the center of this smooth
+  # correction field. Local knots may bend only gradually along trajectory
+  # distance; actual FAST-LIO terrain undulation remains in the source path.
+  prior_sigma: 1.0
+  first_difference_sigma: 0.20
+  second_difference_sigma: 0.08
+  max_local_correction: 3.0
+
+quality:
+  max_z_bias: 5.0
+  max_keyframe_correction: 10.0
+  fail_on_violation: true
+
+output:
+  highrate_topic: /OdometryHighFreq
+  diagnostic_limit_per_class: 12
